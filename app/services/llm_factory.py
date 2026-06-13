@@ -46,14 +46,14 @@ def create_reasoning_llm() -> ChatOpenAI:
 
 
 def create_agent_llm(
-    temperature: float = 0.2,
+    temperature: float = None,
     max_tokens: int = None,
     streaming: bool = False
 ) -> ChatOpenAI:
     """创建智能体决策模型（Qwen3.7-Max，任务规划/分类场景）
 
     Args:
-        temperature: 温度参数，规划类任务建议 0.2
+        temperature: 温度参数，默认使用 PLANNER_TEMPERATURE
         max_tokens: 最大输出Token
         streaming: 是否流式输出
 
@@ -64,7 +64,7 @@ def create_agent_llm(
         model=settings.QWEN_MODEL,
         api_key=settings.QWEN_API_KEY or settings.LLM_API_KEY,  # 降级使用DeepSeek Key
         base_url=settings.QWEN_BASE_URL,
-        temperature=temperature,
+        temperature=temperature if temperature is not None else settings.PLANNER_TEMPERATURE,
         max_tokens=max_tokens or settings.LLM_MAX_TOKENS,
         streaming=streaming
     )

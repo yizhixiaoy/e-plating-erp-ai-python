@@ -5,10 +5,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.api import chat, write, knowledge, health
+from app.api import chat, write, knowledge, health, files
 from app.middleware.auth import AuthMiddleware
-from app.middleware.audit import AuditMiddleware
 from app.services.llm_factory import create_chat_llm, create_agent_llm
+from app.services.memory import MemoryService
+from app.services.oss_storage import OssStorageService
 from app.tools.erp_query import ErpQueryTool
 from app.tools.stats import StatsTool
 from app.tools.knowledge import KnowledgeTool
@@ -45,15 +46,38 @@ async def lifespan(app: FastAPI):
     print(f"[LLM] 对话模型: {settings.LLM_MODEL_CHAT} (高性价比对话)")
     print(f"[LLM] 智能体模型: {settings.QWEN_MODEL} (任务规划/决策)")
 
+    # 初始化OSS对象存储服务（与Java后端FileUploadUtils共享bucket）
+    app.state.oss_service = OssStorageService()
+    print(f"[OSS] 对象存储: {'已启用' if app.state.oss_service.enabled else '已禁用'}")
+
     # 初始化工具
     auth_headers = {}
     app.state.tools = {
         "erp_query_tool": ErpQueryTool(auth_headers=auth_headers),
         "stats_tool": StatsTool(),
-        "knowledge_tool": KnowledgeTool(db_pool=app.state.db_pool),
+        "knowledge_tool": KnowledgeTool(db_pool=app.state.db_pool, oss_service=app.state.oss_service),
         "doc_process_tool": DocProcessTool(db_pool=app.state.db_pool)
     }
     print(f"[工具] 已注册 {len(app.state.tools)} 个工具: {list(app.state.tools.keys())}")
+
+    # 初始化长期记忆服务
+    app.state.memory_service = MemoryService(db_pool=app.state.db_pool)
+    print(f"[Memory] 长期记忆服务: {'已启用' if settings.MEM0_ENABLED else '已禁用'}")
+
+    # 初始化LangGraph Checkpointer（异步PostgresSaver）
+    checkpointer = None
+    try:
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+        async with AsyncPostgresSaver.from_conn_string(
+            f"postgresql://{settings.PG_USER}:{settings.PG_PASSWORD}"
+            f"@{settings.PG_HOST}:{settings.PG_PORT}/{settings.PG_DATABASE}"
+        ) as saver:
+            checkpointer = saver
+        print("[Checkpoint] AsyncPostgresSaver已启用，Agent状态将持久化到PostgreSQL")
+    except ImportError:
+        print("[Checkpoint] langgraph-checkpoint-postgres未安装，跳过Checkpointer")
+    except Exception as e:
+        print(f"[Checkpoint] Checkpointer初始化失败: {e}，将以无状态模式运行")
 
     # 构建Agent图
     from app.agent.graph import build_agent_graph
@@ -61,7 +85,7 @@ async def lifespan(app: FastAPI):
         chat_llm=app.state.chat_llm,
         agent_llm=app.state.agent_llm,
         tools=app.state.tools,
-        checkpointer=None  # 后续可启用PostgresSaver
+        checkpointer=checkpointer
     )
     print("[Agent] LangGraph图已构建")
 
@@ -91,14 +115,14 @@ app.add_middleware(
 # 认证中间件（需在CORS之后）
 app.add_middleware(AuthMiddleware)
 
-# 路由注册
+# 审计中间件（db_pool 通过 request.scope["app"].state.db_pool 动态获取）
+from app.middleware.audit import AuditMiddleware
+app.add_middleware(AuditMiddleware)
 app.include_router(chat.router)
 app.include_router(write.router)
 app.include_router(knowledge.router)
+app.include_router(files.router)
 app.include_router(health.router)
-
-# 审计中间件在路由之后注册
-# (通过app.state.db_pool在lifespan中创建后再添加)
 
 
 @app.get("/")

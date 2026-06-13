@@ -1,6 +1,9 @@
 """LangGraph节点实现：Planner / Executor / Aggregator"""
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+import json
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from app.agent.state import AgentState
+from app.config import settings
+from app.services.context_manager import ContextManager
 
 SYSTEM_PROMPT = """你是电镀行业SaaS ERP系统的智能助理"智镀云AI"，服务于电镀企业的管理人员和操作人员。
 
@@ -23,6 +26,13 @@ SYSTEM_PROMPT = """你是电镀行业SaaS ERP系统的智能助理"智镀云AI"�
 - 权限范围: {data_scope}
 """
 
+# 会话自动标题生成提示词
+TITLE_GENERATION_PROMPT = """根据以下用户的第一条消息，生成一个简短的会话标题（不超过15个字）。
+只输出标题本身，不要加引号或其他修饰。
+
+用户消息：{first_message}
+"""
+
 
 async def planner_node(state: AgentState, llm) -> dict:
     """
@@ -32,15 +42,31 @@ async def planner_node(state: AgentState, llm) -> dict:
     """
     complexity = state["task_complexity"]
     query = state["query"]
+    conversation_history = state.get("conversation_history", [])
+    memory_summary = state.get("memory_summary", "")
 
     if complexity == "simple":
         return {}
+
+    # 构建对话历史摘要（让planner了解上下文）
+    history_text = ""
+    if conversation_history:
+        recent = conversation_history[-settings.AGENT_PLANNER_RECENT_HISTORY:]
+        history_text = "\n".join([
+            f"[{m['role']}] {m['content'][:settings.AGENT_PLANNER_HISTORY_TRUNC]}" for m in recent
+        ])
 
     planning_prompt = f"""你需要为用户问题制定执行计划。
 
 用户问题：{query}
 任务复杂度：{complexity}
+"""
+    if history_text:
+        planning_prompt += f"\n最近对话历史：\n{history_text}\n"
+    if memory_summary:
+        planning_prompt += f"\n用户信息：{memory_summary}\n"
 
+    planning_prompt += """
 可用的工具：
 1. erp_query_tool - 业务数据查询（表名、聚合、筛选条件）
 2. stats_tool - 统计数据分析
@@ -48,21 +74,24 @@ async def planner_node(state: AgentState, llm) -> dict:
 4. doc_process_tool - 文档处理
 
 请制定分步执行计划，输出JSON格式：
-{{
+{
     "steps": [
-        {{"step": 1, "action": "描述", "tool": "工具名", "params": {{...}}}}
+        {"step": 1, "action": "描述", "tool": "工具名", "params": {...}}
     ]
-}}
+}
 """
     messages = [
         SystemMessage(content="你是任务规划助手，为ERP数据分析任务制定执行计划。"),
         HumanMessage(content=planning_prompt)
     ]
 
-    response = await llm.ainvoke(messages, temperature=0.2, max_tokens=1000)
+    response = await llm.ainvoke(
+        messages,
+        temperature=settings.PLANNER_TEMPERATURE,
+        max_tokens=settings.PLANNER_MAX_TOKENS
+    )
 
     try:
-        import json
         content = response.content
         result = json.loads(content)
         return {"plan_steps": result.get("steps", [])}
@@ -74,16 +103,81 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
     """
     执行节点：按计划或直接调用工具
 
-    - simple任务：直接根据用户意图调用对应工具
-    - medium/complex任务：按计划逐步执行
+    - simple任务：使用LLM判断调用哪个工具（单次调用）
+    - medium/complex任务：按planner生成的plan_steps逐步执行多工具
     """
     query = state["query"]
-    tool_calls_pending = state.get("tool_calls_pending", [])
+    plan_steps = state.get("plan_steps", [])
     tool_results = state.get("tool_results", [])
     knowledge_context = state.get("knowledge_context")
     references = state.get("references", [])
+    user_context = state.get("user_context")
+    kb_ids = state.get("kb_ids")
+    file_ids = state.get("file_ids")
+    conversation_id = state.get("conversation_id")
 
-    # 构建带工具描述的请求，让LLM决定调用哪个工具
+    def _inject_context_params(tool_name: str, tool_params: dict) -> dict:
+        """注入租户隔离和请求上下文参数"""
+        params = dict(tool_params)
+        # knowledge_tool：注入tenant_id + kb_ids
+        if tool_name == "knowledge_tool":
+            if user_context:
+                params.setdefault("tenant_id", user_context.tenant_id)
+            if kb_ids and not params.get("kb_ids"):
+                params["kb_ids"] = kb_ids
+        # doc_process_tool：注入file_ids + conversation_id
+        if tool_name == "doc_process_tool":
+            if file_ids and not params.get("file_ids"):
+                params["file_ids"] = file_ids
+            if conversation_id and not params.get("conversation_id"):
+                params["conversation_id"] = conversation_id
+        # erp_query_tool：注入auth_headers
+        if tool_name == "erp_query_tool" and user_context:
+            pass  # auth_headers已在chat.py中通过set_auth_headers注入
+        return params
+
+    def _merge_tool_result(tool_result: dict):
+        """合并工具返回的引用和知识上下文"""
+        nonlocal knowledge_context, references
+        if isinstance(tool_result, dict):
+            if "references" in tool_result:
+                references.extend(tool_result["references"])
+            if "content" in tool_result:
+                if knowledge_context:
+                    knowledge_context += "\n\n" + tool_result["content"]
+                else:
+                    knowledge_context = tool_result["content"]
+
+    # ── 分支1：有执行计划时，按计划逐步执行多个工具 ──
+    if plan_steps:
+        for step in plan_steps:
+            tool_name = step.get("tool")
+            if not tool_name:
+                continue
+
+            tool = tools.get(tool_name)
+            if not tool:
+                continue
+
+            tool_params = _inject_context_params(tool_name, step.get("params", {}))
+
+            try:
+                tool_result = await tool.execute(**tool_params)
+            except Exception as e:
+                tool_results.append({"tool_name": tool_name, "error": str(e)})
+                continue
+
+            new_result = {"tool_name": tool_name, "params": tool_params, "result": tool_result}
+            tool_results.append(new_result)
+            _merge_tool_result(tool_result)
+
+        return {
+            "tool_results": tool_results,
+            "knowledge_context": knowledge_context,
+            "references": references
+        }
+
+    # ── 分支2：无计划时，使用LLM判断调用哪个工具（单次） ──
     tool_descriptions = "\n".join([
         f"- {name}: {tool.description}" for name, tool in tools.items()
     ])
@@ -99,7 +193,8 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
 1. 如果问题涉及知识库查询，调用 knowledge_tool
 2. 如果问题涉及业务数据查询，调用 erp_query_tool
 3. 如果问题涉及统计分析，调用 stats_tool
-4. 如果不需调用任何工具（闲聊、功能咨询），返回空
+4. 如果涉及文档处理，调用 doc_process_tool
+5. 如果不需调用任何工具（闲聊、功能咨询），返回空
 
 输出JSON：
 {{
@@ -119,10 +214,13 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
         HumanMessage(content=executor_prompt)
     ]
 
-    response = await llm.ainvoke(messages, temperature=0.0, max_tokens=500)
+    response = await llm.ainvoke(
+        messages,
+        temperature=settings.EXECUTOR_TOOL_SELECT_TEMP,
+        max_tokens=settings.EXECUTOR_MAX_TOKENS
+    )
 
     try:
-        import json
         content = response.content
         # 提取JSON
         start = content.find("{")
@@ -142,6 +240,9 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
         if not tool:
             return {}
 
+        # 注入上下文参数（租户隔离、kb_ids、file_ids）
+        tool_params = _inject_context_params(tool_name, tool_params)
+
         # 执行工具
         tool_result = await tool.execute(**tool_params)
 
@@ -151,13 +252,7 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
             "result": tool_result
         }
         tool_results.append(new_result)
-
-        # 提取引用来源和知识上下文
-        if isinstance(tool_result, dict):
-            if "references" in tool_result:
-                references.extend(tool_result["references"])
-            if "content" in tool_result:
-                knowledge_context = tool_result["content"]
+        _merge_tool_result(tool_result)
 
         return {
             "tool_results": tool_results,
@@ -175,17 +270,22 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
 
 async def aggregator_node(state: AgentState, llm) -> dict:
     """
-    聚合节点：使用检索上下文和工具结果生成最终回答
+    聚合节点：使用历史上下文、长期记忆、检索结果和工具结果生成最终回答
 
-    这是生成最终回答并发射 reference 事件的地方
+    增强功能：
+    - 通过 ContextManager 管理上下文窗口，智能截断历史消息
+    - 注入长期记忆摘要到 System Prompt
+    - 合并知识库上下文和工具调用结果
     """
     query = state["query"]
     user_context = state["user_context"]
     knowledge_context = state.get("knowledge_context", "")
     tool_results = state.get("tool_results", [])
     references = state.get("references", [])
+    memory_summary = state.get("memory_summary", "")
+    conversation_history = state.get("conversation_history", [])
 
-    # 构建完整上下文
+    # ── 构建合并后的上下文（知识库 + 工具结果） ──
     context_parts = []
 
     if knowledge_context:
@@ -199,31 +299,52 @@ async def aggregator_node(state: AgentState, llm) -> dict:
                     result_content = result_content.get("content", str(result_content))
                 context_parts.append(f"【{tr.get('tool_name', '工具')}结果】\n{result_content}")
 
-    full_context = "\n\n".join(context_parts) if context_parts else "无额外上下文"
+    knowledge_context_combined = "\n\n".join(context_parts) if context_parts else None
 
-    # 构建System Prompt
+    # ── 构建 System Prompt（含长期记忆） ──
     system_prompt = SYSTEM_PROMPT.format(
         tenant_id=user_context.tenant_id,
         user_id=user_context.user_id,
         data_scope=user_context.data_scope or "NONE"
     )
 
-    if full_context != "无额外上下文":
-        system_prompt += f"\n\n请基于以下检索/查询结果回答用户问题，并标注引用来源：\n{full_context}"
+    if memory_summary:
+        system_prompt += f"\n\n【用户长期记忆】\n{memory_summary}"
 
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=query)
-    ]
+    # ── 使用 ContextManager 组装完整消息列表 ──
+    ctx_manager = ContextManager()
+    messages = ctx_manager.build_messages(
+        system_prompt=system_prompt,
+        conversation_history=conversation_history or [],
+        current_input=query,
+        knowledge_context=knowledge_context_combined
+    )
 
-    response = await llm.ainvoke(messages, temperature=settings.LLM_TEMPERATURE, max_tokens=settings.LLM_MAX_TOKENS)
+    # ── 转换为 LangChain 消息格式 ──
+    lc_messages = []
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+        if role == "system":
+            lc_messages.append(SystemMessage(content=content))
+        elif role == "user":
+            lc_messages.append(HumanMessage(content=content))
+        elif role == "assistant":
+            lc_messages.append(AIMessage(content=content))
+
+    response = await llm.ainvoke(
+        lc_messages,
+        temperature=settings.LLM_TEMPERATURE,
+        max_tokens=settings.LLM_MAX_TOKENS
+    )
 
     final_response = response.content
 
     # 估算Token用量
+    input_text = "\n".join(m.get("content", "") for m in messages)
     token_usage = {
-        "input": len(system_prompt) // 2,
-        "output": len(final_response) // 2
+        "input": ctx_manager._estimate_tokens(input_text),
+        "output": ctx_manager._estimate_tokens(final_response)
     }
 
     return {
@@ -233,4 +354,31 @@ async def aggregator_node(state: AgentState, llm) -> dict:
     }
 
 
-from app.config import settings
+async def generate_conversation_title(first_message: str, llm) -> str:
+    """
+    根据用户首条消息自动生成会话标题
+
+    Args:
+        first_message: 用户的第一条消息
+        llm: LLM客户端
+
+    Returns:
+        会话标题（不超过15字）
+    """
+    try:
+        prompt = TITLE_GENERATION_PROMPT.format(first_message=first_message)
+        response = await llm.ainvoke(
+            [HumanMessage(content=prompt)],
+            temperature=settings.TITLE_GEN_TEMPERATURE,
+            max_tokens=settings.TITLE_GEN_MAX_TOKENS
+        )
+        title = response.content.strip()
+        # 截断到上限
+        max_len = settings.CONVERSATION_TITLE_MAX_LENGTH
+        if len(title) > max_len:
+            title = title[:max_len]
+        return title
+    except Exception:
+        # 降级：取消息前N字作为标题
+        max_len = settings.CONVERSATION_TITLE_MAX_LENGTH
+        return first_message[:max_len] if len(first_message) > max_len else first_message

@@ -9,11 +9,11 @@ class ContextManager:
         self,
         max_context_tokens: int = None,
         system_prompt_budget: int = None,
-        output_reserve: int = 2000
+        output_reserve: int = None
     ):
         self.max_context_tokens = max_context_tokens or settings.MAX_CONTEXT_TOKENS
         self.system_prompt_budget = system_prompt_budget or settings.SYSTEM_PROMPT_BUDGET
-        self.output_reserve = output_reserve
+        self.output_reserve = output_reserve or settings.OUTPUT_RESERVE_TOKENS
         self.history_budget = settings.HISTORY_BUDGET
 
     def build_messages(
@@ -79,18 +79,21 @@ class ContextManager:
         return int(chinese_chars / 1.5 + other_chars / 4)
 
 
-async def compress_history(messages: list[dict], keep_recent: int = 6, llm=None) -> list[dict]:
+async def compress_history(messages: list[dict], keep_recent: int = None, llm=None) -> list[dict]:
     """
     历史压缩：超过keep_recent条的消息压缩为摘要
 
     Args:
         messages: 完整消息列表
-        keep_recent: 保留最近N条完整消息
+        keep_recent: 保留最近N条完整消息（默认从config读取）
         llm: LLM客户端
 
     Returns:
         压缩后的消息列表
     """
+    if keep_recent is None:
+        keep_recent = settings.COMPRESS_KEEP_RECENT
+
     if len(messages) <= keep_recent or not llm:
         return messages
 
@@ -102,25 +105,26 @@ async def compress_history(messages: list[dict], keep_recent: int = 6, llm=None)
         for m in old_messages
     ])
 
+    max_chars = settings.COMPRESS_MAX_CHARS
     summary_prompt = f"""请将以下多轮对话压缩为一段简洁的摘要，保留关键信息：
 
 {old_text}
 
-请输出简洁的中文摘要（200字以内）："""
+请输出简洁的中文摘要（{max_chars}字以内）："""
 
     try:
         from langchain_core.messages import HumanMessage
         response = await llm.ainvoke(
             [HumanMessage(content=summary_prompt)],
-            temperature=0.3,
-            max_tokens=300
+            temperature=settings.COMPRESS_TEMPERATURE,
+            max_tokens=settings.COMPRESS_MAX_TOKENS
         )
         summary = response.content
     except Exception:
         summary = "历史对话摘要生成失败"
 
     compressed = [
-        {"role": "system", "content": f"[历史对话摘要] {summary}"}
+        {"role": "user", "content": f"[系统自动生成的历史对话摘要] {summary}"}
     ]
     compressed.extend(recent_messages)
 

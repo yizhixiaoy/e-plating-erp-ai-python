@@ -1,6 +1,5 @@
 """LangGraph图定义与编译"""
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.postgres import PostgresSaver
 
 from app.agent.state import AgentState
 from app.agent.classifier import classify_task
@@ -8,7 +7,7 @@ from app.agent.nodes import planner_node, executor_node, aggregator_node
 from app.config import settings
 
 
-def build_agent_graph(chat_llm, agent_llm, tools: dict, checkpointer: PostgresSaver = None) -> StateGraph:
+def build_agent_graph(chat_llm, agent_llm, tools: dict, checkpointer=None) -> StateGraph:
     """
     构建LangGraph Agent执行图
 
@@ -19,6 +18,12 @@ def build_agent_graph(chat_llm, agent_llm, tools: dict, checkpointer: PostgresSa
     节点流程：
     classifier → (simple?) → executor → aggregator → END
               → (medium/complex?) → planner → executor → aggregator → END
+
+    Args:
+        chat_llm: 高性价比对话模型（DeepSeek-V4-flash）
+        agent_llm: 智能体决策模型（Qwen-Max）
+        tools: 工具字典
+        checkpointer: AsyncPostgresSaver实例，为None时不启用状态持久化
     """
     workflow = StateGraph(AgentState)
 

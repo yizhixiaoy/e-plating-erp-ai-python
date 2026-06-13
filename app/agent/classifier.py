@@ -1,4 +1,5 @@
 """任务复杂度分类器 - 判定任务类型（simple/medium/complex）"""
+import json
 from langchain_core.messages import SystemMessage, HumanMessage
 from app.agent.state import AgentState
 from app.config import settings
@@ -50,12 +51,11 @@ async def classify_task(state: AgentState, llm) -> dict:
 
     response = await llm.ainvoke(
         messages,
-        temperature=0.0,
-        max_tokens=200
+        temperature=settings.CLASSIFIER_TEMPERATURE,
+        max_tokens=settings.CLASSIFIER_MAX_TOKENS
     )
 
     try:
-        import json
         # 提取JSON
         content = response.content
         result = json.loads(content)

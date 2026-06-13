@@ -69,13 +69,17 @@ class MessageView(BaseModel):
     conversation_id: int
     role: str
     content: Optional[str] = None
+    model_name: Optional[str] = None
     tool_calls: Optional[Any] = None
     references: list[ReferenceSource] = Field(default_factory=list)
     token_count: Optional[int] = None
+    token_usage: Optional[dict] = None
+    file_ids: list[str] = Field(default_factory=list)
     created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
+        protected_namespaces = ()
 
 
 # ─── SSE事件 ──────────────────────────────────────────────
@@ -138,9 +142,9 @@ class SSEErrorData(BaseModel):
 
 # ─── 知识库 ───────────────────────────────────────────────
 class KnowledgeBaseScope(str, Enum):
-    PUBLIC = "public"
+    GLOBAL = "global"
     TENANT = "tenant"
-    PRIVATE = "private"
+    PERSONAL = "personal"
 
 
 class KnowledgeBaseCreate(BaseModel):
