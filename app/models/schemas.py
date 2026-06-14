@@ -259,6 +259,8 @@ class UserContext(BaseModel):
     """从Java网关透传的用户上下文"""
     tenant_id: int
     user_id: int
+    username: str = ""
+    nickname: str = ""
     roles: list[str] = Field(default_factory=list)
     permissions: list[str] = Field(default_factory=list)
     data_scope: Optional[str] = None

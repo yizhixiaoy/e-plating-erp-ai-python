@@ -6,6 +6,7 @@ from sse_starlette.sse import EventSourceResponse
 from app.models.schemas import WriterRequest
 from app.services.llm_factory import create_llm
 from app.services.writer import WriterService
+from app.services.permissions import require_perm, AI_PERMS
 from app.config import settings
 
 router = APIRouter(prefix="/api/ai/write", tags=["AI写作"])
@@ -56,8 +57,12 @@ async def writer_stream_generator(prompt_data: dict):
 @router.post("")
 async def write(request: WriterRequest, req: Request):
     """AI写作接口"""
-    pool = req.app.state.db_pool
     user_context = req.state.user_context
+
+    # 权限守卫
+    require_perm(user_context, AI_PERMS.WRITER_VIEW, "使用AI写作")
+
+    pool = req.app.state.db_pool
     oss_service = getattr(req.app.state, "oss_service", None)
 
     # 如果指定了参考文档ID，从知识库检索相关内容作为写作素材

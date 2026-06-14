@@ -2,7 +2,9 @@
 from fastapi import Request, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from app.models.schemas import UserContext
+import logging
 
+logger = logging.getLogger(__name__)
 
 GUEST_ALLOWED_PATHS = {"/api/ai/chat"}
 
@@ -20,10 +22,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # 提取用户上下文
         tenant_id = request.headers.get("X-Tenant-Id", "0")
         user_id = request.headers.get("X-User-Id", "0")
-        roles = request.headers.get("X-Roles", "").split(",") if request.headers.get("X-Roles") else []
-        permissions = request.headers.get("X-Permissions", "").split(",") if request.headers.get("X-Permissions") else []
+        username = request.headers.get("X-Username", "")
+        nickname = request.headers.get("X-Nickname", "")
+        roles = [r for r in request.headers.get("X-Roles", "").split(",") if r] if request.headers.get("X-Roles") else []
+        permissions = [p for p in request.headers.get("X-Permissions", "").split(",") if p] if request.headers.get("X-Permissions") else []
         data_scope = request.headers.get("X-Data-Scope", "NONE")
         auth_mode = request.headers.get("X-Auth-Mode", "guest")
+
+        # 调试日志：记录接收到的权限
+        logger.info(f"AI认证中间件 - 用户: {username}, 角色数: {len(roles)}, 权限数: {len(permissions)}")
+        if permissions:
+            logger.debug(f"AI认证中间件 - 权限列表: {permissions}")
 
         # 访客模式路径校验
         if auth_mode == "guest" and path not in GUEST_ALLOWED_PATHS:
@@ -33,6 +42,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         user_context = UserContext(
             tenant_id=int(tenant_id),
             user_id=int(user_id),
+            username=username,
+            nickname=nickname,
             roles=roles,
             permissions=permissions,
             data_scope=data_scope,

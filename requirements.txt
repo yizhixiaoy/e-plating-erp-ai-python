@@ -8,6 +8,7 @@ pydantic==2.9.0
 langgraph==1.2.4
 langchain==1.3.6
 langchain-openai==1.2.2
+langchain-deepseek==1.1.0
 langgraph-checkpoint-postgres==3.1.0
 
 # Embedding与向量
@@ -32,3 +33,4 @@ sqlalchemy==2.0.35
 httpx==0.28.0
 python-dotenv==1.0.1
 minio==7.2.15                 # MinIO/OSS对象存储
+redis[hiredis]==5.2.1         # Redis缓存

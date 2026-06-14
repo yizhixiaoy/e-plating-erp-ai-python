@@ -2,10 +2,12 @@
 import json
 import re
 from app.tools.base import BaseTool
+from app.services.permissions import AI_PERMS
 
 
 class StatsTool(BaseTool):
     name = "stats_tool"
+    required_permission = AI_PERMS.CHAT_VIEW  # 统计分析需要AI对话权限
     description = """
     对查询结果进行统计分析。支持趋势分析、对比分析、占比计算、汇总统计。
     参数：

@@ -10,6 +10,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/ai/files", tags=["临时文件管理"])
 
+# 兼容前端直接调用的上传路由
+upload_router = APIRouter(prefix="/api/ai/upload", tags=["临时文件上传"])
+
 
 @router.post("/upload")
 async def upload_temp_file(
@@ -259,3 +262,14 @@ def _guess_content_type(file_type: str) -> str:
         "jpeg": "image/jpeg",
     }
     return mime_map.get(file_type.lower(), "application/octet-stream")
+
+
+# 前端直连上传入口（路径兼容）
+@upload_router.post("/temp")
+async def upload_temp_file_compat(
+    file: UploadFile = File(...),
+    conversation_id: int = None,
+    req: Request = None
+):
+    """POST /api/ai/upload/temp — 前端直接调用的上传入口，委托到 upload_temp_file"""
+    return await upload_temp_file(file=file, conversation_id=conversation_id, req=req)

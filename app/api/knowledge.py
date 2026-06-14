@@ -5,8 +5,11 @@ from app.models.schemas import (
     KnowledgeSearchRequest, PageRequest
 )
 from app.config import settings
+from app.services.cache import get_or_set, flush_namespace, CacheNS
+from app.services.permissions import require_perm, require_any_perm, AI_PERMS
 
 router = APIRouter(prefix="/api/ai/knowledge", tags=["知识库管理"])
+_KB_LIST_TTL = 300  # 知识库列表缓存5分钟
 
 
 def _has_kb_permission(permissions: list[str], scope_type: str) -> bool:
@@ -20,52 +23,78 @@ def _has_kb_permission(permissions: list[str], scope_type: str) -> bool:
     return perm in permissions if perm else False
 
 
+def _check_kb_ownership(kb_row, user_context, action: str = "访问"):
+    """校验知识库租户/个人归属，防止跨租户越权操作
+
+    Args:
+        kb_row: 数据库查询行（含 scope_type, tenant_id, created_by）
+        user_context: 用户上下文
+        action: 操作描述（用于错误消息）
+
+    Raises:
+        HTTPException(403): 无权操作
+    """
+    scope = kb_row["scope_type"]
+    if scope == "tenant" and kb_row["tenant_id"] != user_context.tenant_id:
+        raise HTTPException(status_code=403, detail=f"无权{action}该知识库")
+    if scope == "personal" and kb_row["created_by"] != user_context.user_id:
+        raise HTTPException(status_code=403, detail=f"无权{action}该知识库")
+
+
 @router.get("")
 async def list_knowledge_bases(page_num: int = 1, page_size: int = 20, req: Request = None):
-    """知识库列表"""
+    """知识库列表（Redis缓存，5分钟TTL）"""
     pool = req.app.state.db_pool
     user_context = req.state.user_context
 
-    offset = (page_num - 1) * page_size
-    async with pool.acquire() as conn:
-        # 访客模式：仅可见全租户知识库
-        if user_context.auth_mode == "guest":
-            rows = await conn.fetch(
-                """SELECT * FROM knowledge_base
-                   WHERE scope_type = 'global' AND status = 'active' AND is_deleted = FALSE
-                   ORDER BY created_at DESC LIMIT $1 OFFSET $2""",
-                page_size, offset
-            )
-            total = await conn.fetchval(
-                "SELECT COUNT(*) FROM knowledge_base WHERE scope_type = 'global' AND status = 'active' AND is_deleted = FALSE"
-            )
-        else:
-            rows = await conn.fetch(
-                """SELECT * FROM knowledge_base
-                   WHERE is_deleted = FALSE
-                     AND ((scope_type = 'global')
-                      OR (scope_type = 'tenant' AND tenant_id = $3)
-                      OR (scope_type = 'personal' AND created_by = $4))
-                   ORDER BY created_at DESC LIMIT $1 OFFSET $2""",
-                page_size, offset, user_context.tenant_id, user_context.user_id
-            )
-            total = await conn.fetchval(
-                """SELECT COUNT(*) FROM knowledge_base
-                   WHERE is_deleted = FALSE
-                     AND ((scope_type = 'global')
-                      OR (scope_type = 'tenant' AND tenant_id = $1)
-                      OR (scope_type = 'personal' AND created_by = $2))""",
-                user_context.tenant_id, user_context.user_id
-            )
+    # 权限守卫：非访客用户需要知识库查看权限
+    if user_context.auth_mode != "guest":
+        require_perm(user_context, AI_PERMS.KNOWLEDGE_VIEW, "查看知识库")
 
-        items = [dict(row) for row in rows]
-        # 转换时间字段为字符串
-        for item in items:
-            for key in ("created_at", "updated_at"):
-                if item.get(key):
-                    item[key] = item[key].isoformat()
+    cache_key = f"t{user_context.tenant_id}_u{user_context.user_id}_m{user_context.auth_mode}_p{page_num}_s{page_size}"
 
-        return {"total": total, "page_num": page_num, "page_size": page_size, "items": items}
+    async def _fetch():
+        offset = (page_num - 1) * page_size
+        async with pool.acquire() as conn:
+            # 访客模式：仅可见全租户知识库
+            if user_context.auth_mode == "guest":
+                rows = await conn.fetch(
+                    """SELECT * FROM knowledge_base
+                       WHERE scope_type = 'global' AND status = 'active' AND is_deleted = FALSE
+                       ORDER BY created_at DESC LIMIT $1 OFFSET $2""",
+                    page_size, offset
+                )
+                total = await conn.fetchval(
+                    "SELECT COUNT(*) FROM knowledge_base WHERE scope_type = 'global' AND status = 'active' AND is_deleted = FALSE"
+                )
+            else:
+                rows = await conn.fetch(
+                    """SELECT * FROM knowledge_base
+                       WHERE is_deleted = FALSE
+                         AND ((scope_type = 'global')
+                          OR (scope_type = 'tenant' AND tenant_id = $3)
+                          OR (scope_type = 'personal' AND created_by = $4))
+                       ORDER BY created_at DESC LIMIT $1 OFFSET $2""",
+                    page_size, offset, user_context.tenant_id, user_context.user_id
+                )
+                total = await conn.fetchval(
+                    """SELECT COUNT(*) FROM knowledge_base
+                       WHERE is_deleted = FALSE
+                         AND ((scope_type = 'global')
+                          OR (scope_type = 'tenant' AND tenant_id = $1)
+                          OR (scope_type = 'personal' AND created_by = $2))""",
+                    user_context.tenant_id, user_context.user_id
+                )
+
+            items = [dict(row) for row in rows]
+            for item in items:
+                for key in ("created_at", "updated_at"):
+                    if item.get(key):
+                        item[key] = item[key].isoformat()
+
+            return {"total": total, "page_num": page_num, "page_size": page_size, "items": items}
+
+    return await get_or_set(CacheNS.KB_LIST, cache_key, _fetch, _KB_LIST_TTL)
 
 
 @router.post("")
@@ -92,6 +121,7 @@ async def create_knowledge_base(kb: KnowledgeBaseCreate, req: Request):
             kb.chunk_overlap,
             user_context.user_id
         )
+        await flush_namespace(CacheNS.KB_LIST)
         return {"id": kb_id, "name": kb.name}
 
 
@@ -161,13 +191,14 @@ async def update_knowledge_base(kb_id: int, kb: KnowledgeBaseUpdate, req: Reques
     params.extend([kb_id])
 
     async with pool.acquire() as conn:
-        # 权限校验：先查出知识库范围，再检查用户权限
+        # 权限校验：先查出知识库范围，再检查用户权限 + 租户归属
         row = await conn.fetchrow(
-            "SELECT scope_type FROM knowledge_base WHERE id = $1 AND is_deleted = FALSE",
+            "SELECT scope_type, tenant_id, created_by FROM knowledge_base WHERE id = $1 AND is_deleted = FALSE",
             kb_id
         )
         if not row:
             raise HTTPException(status_code=404, detail="知识库不存在")
+        _check_kb_ownership(row, user_context, "编辑")
         if not _has_kb_permission(user_context.permissions, row["scope_type"]):
             raise HTTPException(status_code=403, detail="无编辑该范围知识库的权限")
 
@@ -175,6 +206,7 @@ async def update_knowledge_base(kb_id: int, kb: KnowledgeBaseUpdate, req: Reques
             f"UPDATE knowledge_base SET {', '.join(update_fields)} WHERE id = ${idx} AND is_deleted = FALSE",
             *params
         )
+        await flush_namespace(CacheNS.KB_LIST)
         return {"message": "更新成功"}
 
 
@@ -184,13 +216,14 @@ async def delete_knowledge_base(kb_id: int, req: Request):
     pool = req.app.state.db_pool
     user_context = req.state.user_context
     async with pool.acquire() as conn:
-        # 权限校验：先查出知识库范围，再检查用户权限
+        # 权限校验：先查出知识库范围，再检查用户权限 + 租户归属
         row = await conn.fetchrow(
-            "SELECT scope_type FROM knowledge_base WHERE id = $1 AND is_deleted = FALSE",
+            "SELECT scope_type, tenant_id, created_by FROM knowledge_base WHERE id = $1 AND is_deleted = FALSE",
             kb_id
         )
         if not row:
             raise HTTPException(status_code=404, detail="知识库不存在")
+        _check_kb_ownership(row, user_context, "删除")
         if not _has_kb_permission(user_context.permissions, row["scope_type"]):
             raise HTTPException(status_code=403, detail="无删除该范围知识库的权限")
 
@@ -198,16 +231,28 @@ async def delete_knowledge_base(kb_id: int, req: Request):
             "UPDATE knowledge_base SET is_deleted = TRUE, updated_by = $2, updated_at = NOW() WHERE id = $1 AND is_deleted = FALSE",
             kb_id, user_context.user_id
         )
+        await flush_namespace(CacheNS.KB_LIST)
         return {"message": "删除成功"}
 
 
 @router.post("/{kb_id}/search")
 async def search_knowledge(kb_id: int, search_req: KnowledgeSearchRequest, req: Request):
-    """测试检索"""
+    """知识库检索"""
     from app.tools.knowledge import KnowledgeTool
     pool = req.app.state.db_pool
     user_context = req.state.user_context
     oss_service = getattr(req.app.state, "oss_service", None)
+
+    # 权限校验：先确认用户有权访问该知识库
+    async with pool.acquire() as conn:
+        kb_row = await conn.fetchrow(
+            "SELECT scope_type, tenant_id, created_by FROM knowledge_base WHERE id = $1 AND is_deleted = FALSE",
+            kb_id
+        )
+        if not kb_row:
+            raise HTTPException(status_code=404, detail="知识库不存在")
+        _check_kb_ownership(kb_row, user_context, "检索")
+
     tool = KnowledgeTool(db_pool=pool, oss_service=oss_service)
     result = await tool.execute(
         query=search_req.query, kb_ids=[kb_id],
@@ -268,6 +313,8 @@ async def upload_document(kb_id: int, file: UploadFile = File(...), req: Request
     )
 
     if result["status"] == "completed":
+        await flush_namespace(CacheNS.KB_LIST)
+        await flush_namespace(CacheNS.KB_DOC_LIST)
         return {
             "message": f"文档处理完成，共切分{result['chunk_count']}个片段",
             "doc_id": result["doc_id"],
@@ -298,11 +345,12 @@ async def rebuild_vectors(kb_id: int, req: Request):
     # 权限校验
     async with pool.acquire() as conn:
         kb_row = await conn.fetchrow(
-            "SELECT scope_type, chunk_size, chunk_overlap, tenant_id FROM knowledge_base WHERE id = $1 AND is_deleted = FALSE",
+            "SELECT scope_type, chunk_size, chunk_overlap, tenant_id, created_by FROM knowledge_base WHERE id = $1 AND is_deleted = FALSE",
             kb_id
         )
         if not kb_row:
             raise HTTPException(status_code=404, detail="知识库不存在")
+        _check_kb_ownership(kb_row, user_context, "重建")
         if not _has_kb_permission(user_context.permissions, kb_row["scope_type"]):
             raise HTTPException(status_code=403, detail="无重建该范围知识库的权限")
 
@@ -417,6 +465,66 @@ async def list_documents(
         return {"total": total, "page_num": page_num, "page_size": page_size, "items": items}
 
 
+@router.post("/{kb_id}/documents/{doc_id}/reparse")
+async def reparse_document(kb_id: int, doc_id: int, req: Request):
+    """重新解析单个文档（从OSS下载→重新解析→切块→向量化→入库）"""
+    import asyncio
+    from app.services.document_processor import DocumentProcessor
+    pool = req.app.state.db_pool
+    user_context = req.state.user_context
+    oss_service = getattr(req.app.state, "oss_service", None)
+
+    # 权限校验
+    async with pool.acquire() as conn:
+        kb_row = await conn.fetchrow(
+            "SELECT scope_type, chunk_size, chunk_overlap, tenant_id, created_by FROM knowledge_base WHERE id = $1 AND is_deleted = FALSE",
+            kb_id
+        )
+        if not kb_row:
+            raise HTTPException(status_code=404, detail="知识库不存在")
+        _check_kb_ownership(kb_row, user_context, "重解析")
+        if not _has_kb_permission(user_context.permissions, kb_row["scope_type"]):
+            raise HTTPException(status_code=403, detail="无重解析该知识库文档的权限")
+
+        doc_row = await conn.fetchrow(
+            """SELECT id, oss_path, file_type FROM knowledge_document
+               WHERE id = $1 AND kb_id = $2 AND is_deleted = FALSE""",
+            doc_id, kb_id
+        )
+        if not doc_row:
+            raise HTTPException(status_code=404, detail="文档不存在")
+        if not doc_row["oss_path"]:
+            raise HTTPException(status_code=422, detail="文档无OSS备份，无法重解析")
+
+        # 重置文档状态
+        await conn.execute(
+            "UPDATE knowledge_document SET parse_status = 'pending', updated_at = NOW() WHERE id = $1",
+            doc_id
+        )
+        # 清理旧片段
+        await conn.execute(
+            "UPDATE knowledge_chunk SET is_deleted = TRUE, updated_at = NOW() WHERE doc_id = $1",
+            doc_id
+        )
+
+    # 后台异步重解析
+    processor = DocumentProcessor(db_pool=pool, oss_service=oss_service)
+    asyncio.create_task(
+        processor.reprocess_document(
+            doc_id=doc_id,
+            kb_id=kb_id,
+            tenant_id=kb_row["tenant_id"],
+            user_id=user_context.user_id,
+            oss_path=doc_row["oss_path"],
+            file_type=doc_row["file_type"],
+            chunk_size=kb_row["chunk_size"],
+            chunk_overlap=kb_row["chunk_overlap"]
+        )
+    )
+
+    return {"message": "已启动文档重解析", "doc_id": doc_id, "kb_id": kb_id}
+
+
 @router.delete("/{kb_id}/documents/{doc_id}")
 async def delete_document(kb_id: int, doc_id: int, req: Request):
     """删除知识库文档（逻辑删除，同时清理向量片段）"""
@@ -425,11 +533,12 @@ async def delete_document(kb_id: int, doc_id: int, req: Request):
 
     async with pool.acquire() as conn:
         kb_row = await conn.fetchrow(
-            "SELECT scope_type FROM knowledge_base WHERE id = $1 AND is_deleted = FALSE",
+            "SELECT scope_type, tenant_id, created_by FROM knowledge_base WHERE id = $1 AND is_deleted = FALSE",
             kb_id
         )
         if not kb_row:
             raise HTTPException(status_code=404, detail="知识库不存在")
+        _check_kb_ownership(kb_row, user_context, "删除文档")
         if not _has_kb_permission(user_context.permissions, kb_row["scope_type"]):
             raise HTTPException(status_code=403, detail="无删除文档的权限")
 
@@ -460,4 +569,6 @@ async def delete_document(kb_id: int, doc_id: int, req: Request):
             kb_id, chunk_count, user_context.user_id
         )
 
+        await flush_namespace(CacheNS.KB_LIST)
+        await flush_namespace(CacheNS.KB_DOC_LIST)
         return {"message": "文档已删除"}

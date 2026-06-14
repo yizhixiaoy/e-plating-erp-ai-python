@@ -41,3 +41,6 @@ class AgentState(TypedDict):
 
     # 错误
     error: Optional[str]
+
+    # Token过期标记（Python→Java返回401时，前端全局跳转登录页）
+    token_expired: Optional[bool]

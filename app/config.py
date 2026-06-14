@@ -12,7 +12,7 @@ class Settings:
     APP_NAME: str = os.getenv("APP_NAME", "ERP AI Assistant")
     APP_VERSION: str = os.getenv("APP_VERSION", "1.0.0")
     DEBUG: bool = os.getenv("DEBUG", "false").lower() == "true"
-    CORS_ORIGINS: list[str] = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:8080").split(",")
+    CORS_ORIGINS: list[str] = os.getenv("CORS_ORIGINS", "http://127.0.0.1:5173,http://127.0.0.1:8080").split(",")
     HOST: str = os.getenv("HOST", "0.0.0.0")
     PORT: int = int(os.getenv("PORT", "8000"))
 
@@ -45,7 +45,11 @@ class Settings:
     # LLM - Qwen（智能体决策/任务规划）
     QWEN_API_KEY: str = os.getenv("QWEN_API_KEY", "sk-1f9d720eecb14b629ea92f2f0ef2285b")
     QWEN_BASE_URL: str = os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    QWEN_MODEL: str = os.getenv("QWEN_MODEL", "qwen-max")                        # Qwen3.7-Max
+    QWEN_MODEL: str = os.getenv("QWEN_MODEL", "qwen3.7-max")                   # Qwen3.7-Max 旗舰模型
+
+    # HuggingFace 镜像（国内环境自动使用 hf-mirror.com）
+    # 如果 hf-mirror.com 也不稳定，可以换为 https://hf.xeduapi.com 或 https://hf-mirror.vip 等备用镜像
+    HF_ENDPOINT: str = os.getenv("HF_ENDPOINT", "https://hf-mirror.com")
 
     # Embedding
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
@@ -53,13 +57,26 @@ class Settings:
     RERANK_MODEL: str = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 
     # Java后端API
-    JAVA_API_BASE_URL: str = os.getenv("JAVA_API_BASE_URL", "http://localhost:8080")
+    JAVA_API_BASE_URL: str = os.getenv("JAVA_API_BASE_URL", "http://127.0.0.1:8080")
     JAVA_API_KEY: str = os.getenv("JAVA_API_KEY", "807a4f25de31d333437d71f771bc2b30")
     JAVA_API_TIMEOUT: int = int(os.getenv("JAVA_API_TIMEOUT", "30"))
 
+    # Redis
+    REDIS_HOST: str = os.getenv("REDIS_HOST", "127.0.0.1")
+    REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
+    REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
+    REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
+    REDIS_PREFIX: str = os.getenv("REDIS_PREFIX", "erp_ai:")
+
+    @property
+    def REDIS_URL(self) -> str:
+        if self.REDIS_PASSWORD:
+            return f"redis://:{self.REDIS_PASSWORD}@{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
+        return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
+
     # MinIO / OSS
     OSS_ENABLED: bool = os.getenv("OSS_ENABLED", "true").lower() == "true"
-    OSS_ENDPOINT: str = os.getenv("OSS_ENDPOINT", "localhost:9000")
+    OSS_ENDPOINT: str = os.getenv("OSS_ENDPOINT", "127.0.0.1:9000")
     OSS_ACCESS_KEY: str = os.getenv("OSS_ACCESS_KEY", "minioadmin")
     OSS_SECRET_KEY: str = os.getenv("OSS_SECRET_KEY", "minioadmin")
     OSS_BUCKET: str = os.getenv("OSS_BUCKET", "ai-knowledge")
@@ -112,6 +129,20 @@ class Settings:
     EXECUTOR_MAX_TOKENS: int = int(os.getenv("EXECUTOR_MAX_TOKENS", "500"))
     TITLE_GEN_TEMPERATURE: float = float(os.getenv("TITLE_GEN_TEMPERATURE", "0.1"))
     TITLE_GEN_MAX_TOKENS: int = int(os.getenv("TITLE_GEN_MAX_TOKENS", "50"))
+
+    # ── 各节点 Thinking / Streaming 控制 ──
+    # classifier: 快速分类，不需要thinking和streaming
+    CLASSIFIER_THINKING: bool = os.getenv("CLASSIFIER_THINKING", "false").lower() == "true"
+    CLASSIFIER_STREAMING: bool = os.getenv("CLASSIFIER_STREAMING", "false").lower() == "true"
+    # planner: 任务规划，不需要thinking显示和streaming
+    PLANNER_THINKING: bool = os.getenv("PLANNER_THINKING", "false").lower() == "true"
+    PLANNER_STREAMING: bool = os.getenv("PLANNER_STREAMING", "false").lower() == "true"
+    # executor: 工具选择+执行，不需要thinking和streaming
+    EXECUTOR_THINKING: bool = os.getenv("EXECUTOR_THINKING", "false").lower() == "true"
+    EXECUTOR_STREAMING: bool = os.getenv("EXECUTOR_STREAMING", "false").lower() == "true"
+    # aggregator: 最终回答生成 → 需要thinking（展示推理过程）+ streaming（实时流式输出）
+    AGGREGATOR_THINKING: bool = os.getenv("AGGREGATOR_THINKING", "true").lower() == "true"
+    AGGREGATOR_STREAMING: bool = os.getenv("AGGREGATOR_STREAMING", "true").lower() == "true"
 
     # Agent规划器
     AGENT_PLANNER_RECENT_HISTORY: int = int(os.getenv("AGENT_PLANNER_RECENT_HISTORY", "6"))

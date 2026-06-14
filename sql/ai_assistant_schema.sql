@@ -65,6 +65,12 @@ CREATE TABLE conversation_message (
                                                  --   "similarity":0.92,
                                                  --   "page_number":3,
                                                  --   "section_title":"镀液参数控制"}]
+    thinking_steps  JSONB DEFAULT '[]',          -- AI思考步骤JSON数组
+                                                 -- [{"type":"thinking|tool_start|tool_end",
+                                                 --   "content":"...",
+                                                 --   "toolName":"...",
+                                                 --   "timestamp":0.0}]
+    duration_sec    DOUBLE PRECISION,             -- AI回复耗时（秒），仅role=assistant时有值
     is_streaming    BOOLEAN DEFAULT FALSE,       -- 是否为流式中的占位消息
     is_deleted      BOOLEAN DEFAULT FALSE,       -- 逻辑删除
     created_by      BIGINT,                     -- 创建人用户ID

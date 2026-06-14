@@ -1,10 +1,12 @@
 """对话中临时文档处理工具"""
 from app.tools.base import BaseTool
 from app.config import settings
+from app.services.permissions import AI_PERMS
 
 
 class DocProcessTool(BaseTool):
     name = "doc_process_tool"
+    required_permission = AI_PERMS.CHAT_VIEW  # 文档处理需要AI对话权限
     description = """
     处理用户在对话中上传的临时文档。支持总结、合并对比、提取要点、翻译、数据分析。
     参数：

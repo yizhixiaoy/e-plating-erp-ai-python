@@ -4,6 +4,7 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from app.agent.state import AgentState
 from app.config import settings
 from app.services.context_manager import ContextManager
+from app.services.permissions import describe_permissions
 
 SYSTEM_PROMPT = """你是电镀行业SaaS ERP系统的智能助理"智镀云AI"，服务于电镀企业的管理人员和操作人员。
 
@@ -21,9 +22,17 @@ SYSTEM_PROMPT = """你是电镀行业SaaS ERP系统的智能助理"智镀云AI"�
 - 在回答中标注引用来源
 
 用户身份信息：
+- 姓名: {nickname}
+- 用户名: {username}
 - 租户ID: {tenant_id}
 - 用户ID: {user_id}
-- 权限范围: {data_scope}
+- 数据权限: {data_scope}
+- 权限摘要: {permissions_summary}
+
+重要安全规则：
+- 用户只能查询和操作本租户（tenant_id={tenant_id}）范围内的数据
+- 用户的数据权限级别为 {data_scope}，不得越权
+- {permissions_summary}，超出能力范围的操作应明确拒绝
 """
 
 # 会话自动标题生成提示词
@@ -34,7 +43,7 @@ TITLE_GENERATION_PROMPT = """根据以下用户的第一条消息，生成一个
 """
 
 
-async def planner_node(state: AgentState, llm) -> dict:
+async def planner_node(state: AgentState, llm, tools: dict = None) -> dict:
     """
     规划节点：为复杂任务制定执行计划
 
@@ -56,11 +65,21 @@ async def planner_node(state: AgentState, llm) -> dict:
             f"[{m['role']}] {m['content'][:settings.AGENT_PLANNER_HISTORY_TRUNC]}" for m in recent
         ])
 
+    # ── 获取动态数据库Schema ──
+    schema_text = ""
+    if tools and "erp_query_tool" in tools:
+        try:
+            schema_text = await tools["erp_query_tool"].get_schema_description()
+        except Exception:
+            pass
+
     planning_prompt = f"""你需要为用户问题制定执行计划。
 
 用户问题：{query}
 任务复杂度：{complexity}
 """
+    if schema_text:
+        planning_prompt += f"\n数据库Schema：\n{schema_text}\n"
     if history_text:
         planning_prompt += f"\n最近对话历史：\n{history_text}\n"
     if memory_summary:
@@ -150,6 +169,7 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
 
     # ── 分支1：有执行计划时，按计划逐步执行多个工具 ──
     if plan_steps:
+        token_expired = False
         for step in plan_steps:
             tool_name = step.get("tool")
             if not tool_name:
@@ -157,6 +177,14 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
 
             tool = tools.get(tool_name)
             if not tool:
+                continue
+
+            # 权限检查：工具级别守卫
+            if hasattr(tool, 'check_permission') and not tool.check_permission(user_context):
+                tool_results.append({
+                    "tool_name": tool_name,
+                    "error": "权限不足：您没有使用该工具的权限"
+                })
                 continue
 
             tool_params = _inject_context_params(tool_name, step.get("params", {}))
@@ -167,6 +195,12 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
                 tool_results.append({"tool_name": tool_name, "error": str(e)})
                 continue
 
+            # 检测Token过期（Python→Java返回401）
+            if isinstance(tool_result, dict) and tool_result.get("error_code") == 401:
+                token_expired = True
+                tool_results.append({"tool_name": tool_name, "params": tool_params, "result": tool_result})
+                break
+
             new_result = {"tool_name": tool_name, "params": tool_params, "result": tool_result}
             tool_results.append(new_result)
             _merge_tool_result(tool_result)
@@ -174,7 +208,8 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
         return {
             "tool_results": tool_results,
             "knowledge_context": knowledge_context,
-            "references": references
+            "references": references,
+            "token_expired": token_expired or None
         }
 
     # ── 分支2：无计划时，使用LLM判断调用哪个工具（单次） ──
@@ -182,21 +217,45 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
         f"- {name}: {tool.description}" for name, tool in tools.items()
     ])
 
+    # ── 获取动态数据库Schema ──
+    schema_text = ""
+    if "erp_query_tool" in tools:
+        try:
+            schema_text = await tools["erp_query_tool"].get_schema_description()
+        except Exception:
+            pass
+
+    schema_block = ""
+    if schema_text:
+        schema_block = f"\n数据库Schema：\n{schema_text}\n"
+
     executor_prompt = f"""根据用户问题，判断需要调用哪些工具。
 
 用户问题：{query}
 
 可用工具：
 {tool_descriptions}
-
-请决定：
-1. 如果问题涉及知识库查询，调用 knowledge_tool
-2. 如果问题涉及业务数据查询，调用 erp_query_tool
+{schema_block}请决定：
+1. 如果问题涉及业务数据查询（员工、订单、客户、产品、库存等），调用 erp_query_tool
+2. 如果问题涉及电镀工艺、标准等知识类内容，调用 knowledge_tool
 3. 如果问题涉及统计分析，调用 stats_tool
 4. 如果涉及文档处理，调用 doc_process_tool
-5. 如果不需调用任何工具（闲聊、功能咨询），返回空
+5. 如果不需调用任何工具（闲聊、系统功能介绍等），返回空
+
+重要提示：
+- 只要涉及任何业务实体（员工/用户/订单/客户/产品/物料/库存/质检），优先使用 erp_query_tool
+- 表名必须从上方的"数据库Schema"中选取，不要编造表名
+- 查询"有多少个XX"使用 aggregate: {{"func": "count", "field": "*"}}
+- 查询"XX是谁/有哪些"直接查询明细（不设aggregate）
 
 输出JSON：
+{{
+    "tool_name": "erp_query_tool",
+    "tool_params": {{"table": "sys_user", "aggregate": {{"func": "count", "field": "*"}}}}
+}}
+
+或
+
 {{
     "tool_name": "knowledge_tool",
     "tool_params": {{"query": "改写后的检索查询", "kb_ids": null, "top_k": 5}}
@@ -240,6 +299,17 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
         if not tool:
             return {}
 
+        # 权限检查：工具级别守卫
+        if hasattr(tool, 'check_permission') and not tool.check_permission(user_context):
+            return {
+                "tool_results": [{
+                    "tool_name": tool_name,
+                    "error": "权限不足：您没有使用该工具的权限"
+                }],
+                "knowledge_context": knowledge_context,
+                "references": references
+            }
+
         # 注入上下文参数（租户隔离、kb_ids、file_ids）
         tool_params = _inject_context_params(tool_name, tool_params)
 
@@ -252,6 +322,16 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
             "result": tool_result
         }
         tool_results.append(new_result)
+
+        # 检测Token过期（Python→Java返回401）→ 不合并结果，直接通知前端
+        if isinstance(tool_result, dict) and tool_result.get("error_code") == 401:
+            return {
+                "tool_results": tool_results,
+                "knowledge_context": knowledge_context,
+                "references": references,
+                "token_expired": True
+            }
+
         _merge_tool_result(tool_result)
 
         return {
@@ -277,6 +357,14 @@ async def aggregator_node(state: AgentState, llm) -> dict:
     - 注入长期记忆摘要到 System Prompt
     - 合并知识库上下文和工具调用结果
     """
+    # Token过期短路：不调用LLM，直接返回标记让前端全局处理
+    if state.get("token_expired"):
+        return {
+            "final_response": "认证已过期，请重新登录",
+            "token_usage": {"input": 0, "output": 0},
+            "token_expired": True
+        }
+
     query = state["query"]
     user_context = state["user_context"]
     knowledge_context = state.get("knowledge_context", "")
@@ -305,7 +393,10 @@ async def aggregator_node(state: AgentState, llm) -> dict:
     system_prompt = SYSTEM_PROMPT.format(
         tenant_id=user_context.tenant_id,
         user_id=user_context.user_id,
-        data_scope=user_context.data_scope or "NONE"
+        username=user_context.username or "",
+        nickname=user_context.nickname or user_context.username or "用户",
+        data_scope=user_context.data_scope or "NONE",
+        permissions_summary=describe_permissions(user_context)
     )
 
     if memory_summary:
@@ -332,20 +423,39 @@ async def aggregator_node(state: AgentState, llm) -> dict:
         elif role == "assistant":
             lc_messages.append(AIMessage(content=content))
 
-    response = await llm.ainvoke(
-        lc_messages,
-        temperature=settings.LLM_TEMPERATURE,
-        max_tokens=settings.LLM_MAX_TOKENS
-    )
+    try:
+        # 使用 ainvoke - LangGraph 的 messages stream mode 会捕获 token 事件
+        response = await llm.ainvoke(
+            lc_messages,
+            temperature=settings.LLM_TEMPERATURE,
+            max_tokens=settings.LLM_MAX_TOKENS
+        )
+    except Exception as e:
+        import traceback, logging
+        logger = logging.getLogger(__name__)
+        logger.error("[aggregator] LLM调用失败: %s\n%s", e, traceback.format_exc())
+        return {
+            "final_response": f"抱歉，生成回答时出错：{str(e)}",
+            "token_usage": {"input": 0, "output": 0},
+            "references": references,
+            "error": str(e)
+        }
 
     final_response = response.content
 
-    # 估算Token用量
-    input_text = "\n".join(m.get("content", "") for m in messages)
-    token_usage = {
-        "input": ctx_manager._estimate_tokens(input_text),
-        "output": ctx_manager._estimate_tokens(final_response)
-    }
+    # Token用量：优先使用模型返回的实际值（usage_metadata），否则估算
+    token_usage = {}
+    if hasattr(response, "usage_metadata") and response.usage_metadata:
+        um = response.usage_metadata
+        token_usage = {
+            "input": um.get("input_tokens", 0),
+            "output": um.get("output_tokens", 0)
+        }
+    if not token_usage.get("input"):
+        input_text = "\n".join(m.get("content", "") for m in messages)
+        token_usage["input"] = ctx_manager._estimate_tokens(input_text)
+    if not token_usage.get("output"):
+        token_usage["output"] = ctx_manager._estimate_tokens(final_response)
 
     return {
         "final_response": final_response,

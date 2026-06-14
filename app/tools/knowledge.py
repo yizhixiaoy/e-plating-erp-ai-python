@@ -1,13 +1,18 @@
 """知识库检索工具 - pgvector向量检索 + BM25 + RRF融合 + Rerank"""
 import asyncio
+import logging
 from app.tools.base import BaseTool
 from app.config import settings
+from app.services.permissions import AI_PERMS
 import asyncpg
 import json
+
+logger = logging.getLogger(__name__)
 
 
 class KnowledgeTool(BaseTool):
     name = "knowledge_tool"
+    required_permission = AI_PERMS.KNOWLEDGE_VIEW  # 知识库检索需要知识库查看权限
     description = """
     检索知识库中的文档片段。用于回答电镀工艺、SOP、质检标准等知识类问题。
     支持混合检索（向量+BM25）+ RRF融合 + Rerank重排序。
@@ -17,6 +22,10 @@ class KnowledgeTool(BaseTool):
     - top_k: 返回片段数量（默认5）
     - tenant_id: 租户ID（数据隔离）
     返回检索到的文本内容和引用来源。
+    
+    权限说明：
+    - 访客模式：只能检索全局共享知识库（scope_type='global'）
+    - 登录用户：可检索全局共享 + 租户级知识库（需ai:knowledge:view权限）
     """
 
     def __init__(self, db_pool: asyncpg.Pool = None, oss_service=None):
@@ -27,6 +36,16 @@ class KnowledgeTool(BaseTool):
         self.top_k = settings.RAG_TOP_K
         self.similarity_threshold = settings.RAG_SIMILARITY_THRESHOLD
         self.rerank_enabled = True   # Rerank总开关（模型加载失败时自动降级）
+        self.embedding_ready = False  # Embedding模型加载完毕标志
+        self._embedding_load_error = None  # 记录加载失败原因
+
+    def check_permission(self, user_context=None) -> bool:
+        """重写权限检查：访客模式允许使用知识库工具（仅限全局共享库）"""
+        # 访客模式：允许访问全局共享知识库
+        if user_context and user_context.auth_mode == "guest":
+            return True
+        # 登录用户：需要ai:knowledge:view权限
+        return super().check_permission(user_context)
 
     async def execute(
         self,
@@ -46,6 +65,7 @@ class KnowledgeTool(BaseTool):
         top_k = top_k or self.top_k
 
         if not self.db_pool:
+            logger.warning("[knowledge] 数据库连接池未就绪")
             return {"content": "知识库检索服务暂未就绪", "references": []}
 
         try:
@@ -56,6 +76,9 @@ class KnowledgeTool(BaseTool):
                 kb_filter, tenant_filter, base_params = self._build_filters(
                     kb_ids, tenant_id
                 )
+
+                logger.info("[knowledge] 开始检索: query=%r, kb_ids=%s, tenant_id=%s, top_k=%d",
+                           query[:80], kb_ids, tenant_id, top_k)
 
                 # ── 1. 向量检索 ──
                 query_embedding = await self._get_query_embedding(query)
@@ -105,6 +128,7 @@ class KnowledgeTool(BaseTool):
                 fused = self._rrf_fusion(vector_rows, bm25_rows, k=60)
 
                 if not fused:
+                    logger.info("[knowledge] 检索无结果: query=%r", query[:80])
                     return {"content": "未找到相关知识。", "references": []}
 
                 # ── 4. Rerank精排（取前top_k*2候选重排序） ──
@@ -113,8 +137,8 @@ class KnowledgeTool(BaseTool):
                     try:
                         reranked = await self._rerank(query, candidates)
                         candidates = reranked
-                    except Exception:
-                        pass  # Rerank失败时降级使用RRF排序结果
+                    except Exception as e:
+                        logger.warning("[knowledge] Rerank失败，使用RRF结果降级: %s", e)
 
                 # ── 5. 过滤 + 构建结果 ──
                 references = []
@@ -155,19 +179,30 @@ class KnowledgeTool(BaseTool):
 
                 context = "\n\n---\n\n".join(context_parts) if context_parts else "未找到相关知识。"
 
+                logger.info("[knowledge] 检索完成: query=%r, results=%d, top_score=%.4f",
+                           query[:80], len(references),
+                           references[0]["similarity"] if references else 0)
+
                 return {
                     "content": context,
                     "references": references
                 }
 
         except Exception as e:
+            logger.error("[knowledge] 检索异常: query=%r, err=%s", query[:80], e, exc_info=True)
             return {
-                "content": f"知识库检索异常: {str(e)}",
+                "content": f"知识库检索异常，请稍后重试",
                 "references": []
             }
 
     def _build_filters(self, kb_ids: list[int] = None, tenant_id: int = None) -> tuple:
-        """构建SQL过滤条件，返回 (kb_filter, tenant_filter, params)"""
+        """构建SQL过滤条件，返回 (kb_filter, tenant_filter, params)
+        
+        权限逻辑：
+        - tenant_id is None：未知租户状态，仅检索全局库（安全保守策略）
+        - tenant_id == 0：访客模式，仅检索全局库
+        - tenant_id > 0：登录用户，检索全局库 + 租户库
+        """
         params = []
         # 参数从$2开始（$1被query或embedding占用）
         param_idx = 2
@@ -179,12 +214,17 @@ class KnowledgeTool(BaseTool):
             param_idx += 1
 
         tenant_filter = ""
-        if tenant_id:
+        if tenant_id is None:
+            # 未指定租户ID（安全保守策略）：仅检索全局库
+            tenant_filter = "AND kb.scope_type = 'global'"
+        elif tenant_id == 0:
+            # 访客模式：仅检索全局共享知识库
+            tenant_filter = "AND kb.scope_type = 'global'"
+        else:
+            # 登录用户（tenant_id > 0）：检索全局库 + 租户库
             tenant_filter = f"AND (kb.scope_type = 'global' OR kb.tenant_id = ${param_idx})"
             params.append(tenant_id)
             param_idx += 1
-        else:
-            tenant_filter = "AND kb.scope_type = 'global'"
 
         return kb_filter, tenant_filter, params
 
@@ -250,16 +290,27 @@ class KnowledgeTool(BaseTool):
         return candidates
 
     async def _get_query_embedding(self, query: str) -> list[float]:
-        """获取查询向量"""
+        """获取查询向量（首次调用时加载模型）"""
+        if self._embedding_load_error:
+            raise RuntimeError(f"Embedding模型加载失败: {self._embedding_load_error}")
+
         if not self.embedding_model:
-            from FlagEmbedding import FlagModel
-            # FlagModel初始化是CPU密集操作（加载模型权重），放入线程池避免阻塞事件循环
-            self.embedding_model = await asyncio.to_thread(
-                lambda: FlagModel(
-                    settings.EMBEDDING_MODEL,
-                    query_instruction_for_retrieval="为这个句子生成表示以用于检索相关文章："
+            try:
+                from FlagEmbedding import FlagModel
+                logger.info("[knowledge] 开始加载Embedding模型: %s", settings.EMBEDDING_MODEL)
+                # FlagModel初始化是CPU密集操作（加载模型权重），放入线程池避免阻塞事件循环
+                self.embedding_model = await asyncio.to_thread(
+                    lambda: FlagModel(
+                        settings.EMBEDDING_MODEL,
+                        query_instruction_for_retrieval="为这个句子生成表示以用于检索相关文章："
+                    )
                 )
-            )
+                self.embedding_ready = True
+                logger.info("[knowledge] Embedding模型加载完成: %s", settings.EMBEDDING_MODEL)
+            except Exception as e:
+                self._embedding_load_error = str(e)
+                logger.error("[knowledge] Embedding模型加载失败: %s, err=%s", settings.EMBEDDING_MODEL, e)
+                raise RuntimeError(f"Embedding模型加载失败: {e}")
         # FlagEmbedding.encode是CPU密集操作，放入线程池避免阻塞事件循环
         embedding = await asyncio.to_thread(
             lambda: self.embedding_model.encode(query)
