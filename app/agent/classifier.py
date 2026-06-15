@@ -1,8 +1,12 @@
 """任务复杂度分类器 - 判定任务类型（simple/medium/complex）"""
 import json
+import logging
 from langchain_core.messages import SystemMessage, HumanMessage
 from app.agent.state import AgentState
+from app.agent.nodes import _get_llm_content, _extract_json
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 CLASSIFIER_PROMPT = """你是ERP智能助理的任务分类器。分析用户提问，判定任务复杂度。
 
@@ -61,16 +65,29 @@ async def classify_task(state: AgentState, llm) -> dict:
     )
 
     try:
-        # 提取JSON
-        content = response.content
-        result = json.loads(content)
+        # 防御性提取内容（兼容思考模式content为空）
+        content = _get_llm_content(response)
+        if not content.strip():
+            logger.warning("[classifier] LLM返回空内容，默认simple")
+            return {"task_complexity": "simple", "requires_confirmation": False}
+
+        # 健壮JSON提取（兼容markdown代码块包裹/截断修复）
+        result = _extract_json(content)
+        if result is None:
+            # _extract_json失败，尝试直接json.loads（兼容旧格式）
+            result = json.loads(content)
+
+        complexity = result.get("complexity", "simple")
+        reason = result.get("reason", "")
+        logger.info("[classifier] query=%r → complexity=%s, reason=%s", query[:50], complexity, reason)
 
         return {
-            "task_complexity": result.get("complexity", "simple"),
+            "task_complexity": complexity,
             "requires_confirmation": result.get("requires_confirmation", False)
         }
-    except (json.JSONDecodeError, AttributeError):
+    except (json.JSONDecodeError, AttributeError) as e:
         # 默认判定为简单任务
+        logger.warning("[classifier] JSON解析失败，默认simple: %s, raw=%r", e, str(response.content)[:100] if response.content else "")
         return {
             "task_complexity": "simple",
             "requires_confirmation": False

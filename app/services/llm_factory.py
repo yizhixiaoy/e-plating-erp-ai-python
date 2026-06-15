@@ -38,9 +38,11 @@ def create_chat_llm(
         "max_tokens": max_tokens or settings.LLM_MAX_TOKENS,
         "streaming": streaming,
     }
-    # 启用 thinking 模式：DeepSeek API 通过 extra_body 传入 {"thinking": {"type": "enabled"}}
-    if enable_thinking:
-        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+    # DeepSeek 思考模式默认开启，必须显式设置 thinking type
+    # 不设置时模型仍会消耗 max_tokens 做内部推理，导致 content 为空
+    kwargs["extra_body"] = {
+        "thinking": {"type": "enabled" if enable_thinking else "disabled"}
+    }
     return ChatDeepSeek(**kwargs)
 
 
@@ -65,8 +67,10 @@ def create_reasoning_llm(
         "max_tokens": settings.LLM_MAX_TOKENS,
         "streaming": streaming,
     }
-    if enable_thinking:
-        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+    # DeepSeek 思考模式默认开启，必须显式设置 thinking type
+    kwargs["extra_body"] = {
+        "thinking": {"type": "enabled" if enable_thinking else "disabled"}
+    }
     return ChatDeepSeek(**kwargs)
 
 
@@ -97,9 +101,8 @@ def create_agent_llm(
         "max_tokens": max_tokens or settings.LLM_MAX_TOKENS,
         "streaming": streaming,
     }
-    # Qwen 通过 enable_thinking 参数开启思考模式
-    if enable_thinking:
-        kwargs["extra_body"] = {"enable_thinking": True}
+    # Qwen 通过 enable_thinking 参数控制思考模式（默认关闭，避免 content 为空）
+    kwargs["extra_body"] = {"enable_thinking": bool(enable_thinking)}
     return ChatOpenAI(**kwargs)
 
 

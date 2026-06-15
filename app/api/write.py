@@ -6,7 +6,7 @@ from sse_starlette.sse import EventSourceResponse
 from app.models.schemas import WriterRequest
 from app.services.llm_factory import create_llm
 from app.services.writer import WriterService
-from app.services.permissions import require_perm, AI_PERMS
+from app.services.permissions import require_perm, AI_PERMS, is_platform_admin
 from app.config import settings
 
 router = APIRouter(prefix="/api/ai/write", tags=["AI写作"])
@@ -75,7 +75,8 @@ async def write(request: WriterRequest, req: Request):
             query=request.topic,
             kb_ids=None,  # 从所有可见库检索
             top_k=settings.RAG_TOP_K,
-            tenant_id=user_context.tenant_id
+            tenant_id=user_context.tenant_id,
+            is_platform_admin=is_platform_admin(user_context)
         )
         if result.get("content") and result["content"] != "未找到相关知识。":
             knowledge_context = result["content"]

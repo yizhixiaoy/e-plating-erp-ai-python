@@ -122,11 +122,11 @@ class Settings:
     # LLM温度和Token（各节点独立配置，默认继承全局LLM_TEMPERATURE）
     LLM_WRITER_TEMPERATURE: float = float(os.getenv("LLM_WRITER_TEMPERATURE", "0.7"))
     CLASSIFIER_TEMPERATURE: float = float(os.getenv("CLASSIFIER_TEMPERATURE", "0.0"))
-    CLASSIFIER_MAX_TOKENS: int = int(os.getenv("CLASSIFIER_MAX_TOKENS", "200"))
+    CLASSIFIER_MAX_TOKENS: int = int(os.getenv("CLASSIFIER_MAX_TOKENS", "500"))
     PLANNER_TEMPERATURE: float = float(os.getenv("PLANNER_TEMPERATURE", "0.2"))
     PLANNER_MAX_TOKENS: int = int(os.getenv("PLANNER_MAX_TOKENS", "1000"))
     EXECUTOR_TOOL_SELECT_TEMP: float = float(os.getenv("EXECUTOR_TOOL_SELECT_TEMP", "0.0"))
-    EXECUTOR_MAX_TOKENS: int = int(os.getenv("EXECUTOR_MAX_TOKENS", "500"))
+    EXECUTOR_MAX_TOKENS: int = int(os.getenv("EXECUTOR_MAX_TOKENS", "1000"))
     TITLE_GEN_TEMPERATURE: float = float(os.getenv("TITLE_GEN_TEMPERATURE", "0.1"))
     TITLE_GEN_MAX_TOKENS: int = int(os.getenv("TITLE_GEN_MAX_TOKENS", "50"))
 

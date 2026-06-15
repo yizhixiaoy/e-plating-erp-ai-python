@@ -17,7 +17,8 @@ def build_agent_graph(chat_llm, agent_llm, tools: dict, checkpointer=None):
 
     节点流程：
     classifier → (simple?) → executor → aggregator → END
-              → (medium/complex?) → planner → executor → aggregator → END
+              → (medium/complex?) → planner → (plan_confirmed?) → executor → aggregator → END
+                                                                → (未确认)  → aggregator → END（等待用户确认）
 
     Thinking/Streaming 按节点控制：
     - classifier: thinking=OFF, streaming=OFF（快速分类）
@@ -76,6 +77,9 @@ def build_agent_graph(chat_llm, agent_llm, tools: dict, checkpointer=None):
 
     # 条件路由：根据复杂度决定下一步
     def route_by_complexity(state: AgentState) -> str:
+        # 用户已确认计划 → 跳过planner，直接执行
+        if state.get("plan_confirmed") and state.get("plan_steps"):
+            return "executor"
         complexity = state.get("task_complexity", "simple")
         if complexity == "simple":
             return "executor"
@@ -91,8 +95,20 @@ def build_agent_graph(chat_llm, agent_llm, tools: dict, checkpointer=None):
         }
     )
 
-    # planner → executor
-    workflow.add_edge("planner", "executor")
+    # planner → 条件路由（已确认→executor，未确认→aggregator直接结束）
+    def route_after_planner(state: AgentState) -> str:
+        if state.get("plan_confirmed"):
+            return "executor"
+        return "aggregator"
+
+    workflow.add_conditional_edges(
+        "planner",
+        route_after_planner,
+        {
+            "executor": "executor",
+            "aggregator": "aggregator"
+        }
+    )
 
     # executor → aggregator
     workflow.add_edge("executor", "aggregator")

@@ -24,18 +24,37 @@ class AI_PERMS:
     KB_MANAGE_ANY = {KNOWLEDGE_MANAGE_GLOBAL, KNOWLEDGE_MANAGE_TENANT, KNOWLEDGE_MANAGE_PERSONAL}
 
 
+# ── 平台管理员角色常量 ──────────────────────────────────────────────────────
+PLATFORM_ADMIN_ROLES = {"system"}  # 与 RBAC 角色代码对齐：system = 系统管理员（L1）
+
+
 # ── 权限检查函数 ──────────────────────────────────────────────────────────
 
+def is_platform_admin(user_context: UserContext) -> bool:
+    """判断用户是否为平台管理员（拥有 system 角色），可跨租户访问"""
+    if not user_context or not user_context.roles:
+        return False
+    return bool(set(user_context.roles) & PLATFORM_ADMIN_ROLES)
+
+
 def has_perm(user_context: UserContext, perm: str) -> bool:
-    """检查用户是否拥有特定权限"""
-    if not user_context or not user_context.permissions:
+    """检查用户是否拥有特定权限（平台管理员隐式拥有所有权限）"""
+    if not user_context:
+        return False
+    if is_platform_admin(user_context):
+        return True
+    if not user_context.permissions:
         return False
     return perm in user_context.permissions
 
 
 def has_any_perm(user_context: UserContext, perms: set) -> bool:
-    """检查用户是否拥有任一权限（适用于多级权限场景）"""
-    if not user_context or not user_context.permissions:
+    """检查用户是否拥有任一权限（适用于多级权限场景，平台管理员隐式通过）"""
+    if not user_context:
+        return False
+    if is_platform_admin(user_context):
+        return True
+    if not user_context.permissions:
         return False
     return bool(set(user_context.permissions) & perms)
 
@@ -94,15 +113,19 @@ def describe_permissions(user_context: UserContext) -> str:
     if roles:
         parts.append(f"角色: {', '.join(roles)}")
 
+    # 平台管理员特殊能力
+    if is_platform_admin(user_context):
+        parts.append("身份: 平台管理员（可跨租户访问所有数据）")
+
     # 权限能力描述
     capabilities = []
-    if AI_PERMS.KNOWLEDGE_VIEW in perms:
+    if has_perm(user_context, AI_PERMS.KNOWLEDGE_VIEW):
         capabilities.append("知识库检索")
     if has_any_perm(user_context, AI_PERMS.KB_MANAGE_ANY):
         capabilities.append("知识库管理")
-    if AI_PERMS.CHAT_VIEW in perms:
+    if has_perm(user_context, AI_PERMS.CHAT_VIEW):
         capabilities.append("业务数据查询·统计分析")
-    if AI_PERMS.WRITER_VIEW in perms:
+    if has_perm(user_context, AI_PERMS.WRITER_VIEW):
         capabilities.append("AI写作")
 
     if capabilities:

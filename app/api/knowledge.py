@@ -6,7 +6,7 @@ from app.models.schemas import (
 )
 from app.config import settings
 from app.services.cache import get_or_set, flush_namespace, CacheNS
-from app.services.permissions import require_perm, require_any_perm, AI_PERMS
+from app.services.permissions import require_perm, require_any_perm, AI_PERMS, is_platform_admin
 
 router = APIRouter(prefix="/api/ai/knowledge", tags=["知识库管理"])
 _KB_LIST_TTL = 300  # 知识库列表缓存5分钟
@@ -26,6 +26,8 @@ def _has_kb_permission(permissions: list[str], scope_type: str) -> bool:
 def _check_kb_ownership(kb_row, user_context, action: str = "访问"):
     """校验知识库租户/个人归属，防止跨租户越权操作
 
+    平台管理员（system角色）可跨租户操作任意知识库。
+
     Args:
         kb_row: 数据库查询行（含 scope_type, tenant_id, created_by）
         user_context: 用户上下文
@@ -34,6 +36,9 @@ def _check_kb_ownership(kb_row, user_context, action: str = "访问"):
     Raises:
         HTTPException(403): 无权操作
     """
+    # 平台管理员跳过租户隔离
+    if is_platform_admin(user_context):
+        return
     scope = kb_row["scope_type"]
     if scope == "tenant" and kb_row["tenant_id"] != user_context.tenant_id:
         raise HTTPException(status_code=403, detail=f"无权{action}该知识库")
@@ -127,19 +132,31 @@ async def create_knowledge_base(kb: KnowledgeBaseCreate, req: Request):
 
 @router.get("/{kb_id}")
 async def get_knowledge_base(kb_id: int, req: Request):
-    """知识库详情"""
+    """知识库详情
+
+    平台管理员可查看任意租户的知识库详情。
+    """
     pool = req.app.state.db_pool
     user_context = req.state.user_context
+    admin_mode = is_platform_admin(user_context)
+
     async with pool.acquire() as conn:
-        # tenant_id 隔离：global 库任意可见，tenant/personal 库须匹配
-        row = await conn.fetchrow(
-            """SELECT * FROM knowledge_base
-               WHERE id = $1 AND is_deleted = FALSE
-                 AND (scope_type = 'global'
-                      OR (scope_type = 'tenant' AND tenant_id = $2)
-                      OR (scope_type = 'personal' AND created_by = $3))""",
-            kb_id, user_context.tenant_id, user_context.user_id
-        )
+        if admin_mode:
+            # 平台管理员：跳过租户隔离，直接查询
+            row = await conn.fetchrow(
+                "SELECT * FROM knowledge_base WHERE id = $1 AND is_deleted = FALSE",
+                kb_id
+            )
+        else:
+            # 普通用户：global 库任意可见，tenant/personal 库须匹配
+            row = await conn.fetchrow(
+                """SELECT * FROM knowledge_base
+                   WHERE id = $1 AND is_deleted = FALSE
+                     AND (scope_type = 'global'
+                          OR (scope_type = 'tenant' AND tenant_id = $2)
+                          OR (scope_type = 'personal' AND created_by = $3))""",
+                kb_id, user_context.tenant_id, user_context.user_id
+            )
         if not row:
             raise HTTPException(status_code=404, detail="知识库不存在")
         result = dict(row)
@@ -256,7 +273,8 @@ async def search_knowledge(kb_id: int, search_req: KnowledgeSearchRequest, req: 
     tool = KnowledgeTool(db_pool=pool, oss_service=oss_service)
     result = await tool.execute(
         query=search_req.query, kb_ids=[kb_id],
-        top_k=search_req.top_k, tenant_id=user_context.tenant_id
+        top_k=search_req.top_k, tenant_id=user_context.tenant_id,
+        is_platform_admin=is_platform_admin(user_context)
     )
     return result
 
@@ -429,12 +447,13 @@ async def list_documents(
         if not kb_row:
             raise HTTPException(status_code=404, detail="知识库不存在")
 
-        # 权限校验
-        scope = kb_row["scope_type"]
-        if scope == "tenant" and kb_row["tenant_id"] != user_context.tenant_id:
-            raise HTTPException(status_code=403, detail="无权访问该知识库")
-        elif scope == "personal" and kb_row["created_by"] != user_context.user_id:
-            raise HTTPException(status_code=403, detail="无权访问该知识库")
+        # 权限校验（平台管理员跳过租户隔离）
+        if not is_platform_admin(user_context):
+            scope = kb_row["scope_type"]
+            if scope == "tenant" and kb_row["tenant_id"] != user_context.tenant_id:
+                raise HTTPException(status_code=403, detail="无权访问该知识库")
+            elif scope == "personal" and kb_row["created_by"] != user_context.user_id:
+                raise HTTPException(status_code=403, detail="无权访问该知识库")
 
         rows = await conn.fetch(
             """SELECT id, title, file_name, file_type, file_size, chunk_count,

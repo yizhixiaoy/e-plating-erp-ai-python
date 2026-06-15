@@ -1,10 +1,90 @@
 """LangGraph节点实现：Planner / Executor / Aggregator"""
+import inspect
 import json
+import logging
+import re
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from app.agent.state import AgentState
 from app.config import settings
 from app.services.context_manager import ContextManager
-from app.services.permissions import describe_permissions
+from app.services.permissions import describe_permissions, is_platform_admin
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_json(text: str) -> dict | None:
+    """从LLM返回文本中提取JSON对象，兼容markdown代码块包裹"""
+    # 优先匹配 ```json ... ``` 或 ``` ... ``` 代码块
+    m = re.search(r'```(?:json)?\s*\n?(.*?)```', text, re.DOTALL)
+    if m:
+        text = m.group(1).strip()
+    # 提取最外层 {...}
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start >= 0 and end > start:
+        return json.loads(text[start:end])
+    return None
+
+
+def _get_llm_content(response) -> str:
+    """从LLM响应中提取实际内容，兼容思考模式导致content为空的情况
+
+    Qwen3思考模式下：content为空，实际回答在additional_kwargs.reasoning_content中
+    """
+    content = response.content or ""
+    if content.strip():
+        return content
+    # 兜底：检查additional_kwargs中的reasoning_content
+    if hasattr(response, "additional_kwargs"):
+        reasoning = response.additional_kwargs.get("reasoning_content", "")
+        if reasoning:
+            logger.warning("[llm] content为空，从reasoning_content兜底提取 (前100字): %r", reasoning[:100])
+            return reasoning
+    logger.warning("[llm] content和reasoning_content均为空，response type=%s, additional_kwargs=%s",
+                   type(response).__name__,
+                   getattr(response, "additional_kwargs", "N/A"))
+    return ""
+
+
+def _infer_tool_from_text(text: str, tools: dict, query: str) -> dict | None:
+    """当LLM未返回有效JSON时，从原始文本中智能推断应调用的工具
+
+    根据关键词匹配选择工具：
+    - 涉及数据库表名/SQL → erp_query_tool
+    - 涉及电镀工艺/知识 → knowledge_tool
+    - 涉及统计/分析/图表 → stats_tool
+    - 涉及文档处理 → doc_process_tool
+    """
+    text_lower = text.lower()
+    # 优先匹配工具名的精确提及
+    for tool_name in tools:
+        if tool_name in text_lower:
+            return {"tool_name": tool_name, "tool_params": _default_params(tool_name, query)}
+    # 关键词推断
+    erp_keywords = ["sys_", "tenant", "user", "order", "product", "sql", "table",
+                    "员工", "订单", "客户", "产品", "库存", "质检", "公司", "数据库"]
+    knowledge_keywords = ["知识库", "电镀", "工艺", "标准", "文档", "技术"]
+    stats_keywords = ["统计", "图表", "分析", "报表", "趋势"]
+
+    if any(kw in text_lower for kw in erp_keywords):
+        return {"tool_name": "erp_query_tool", "tool_params": {"query": query}}
+    if any(kw in text for kw in knowledge_keywords):
+        return {"tool_name": "knowledge_tool", "tool_params": {"query": query, "kb_ids": None, "top_k": 5}}
+    if any(kw in text for kw in stats_keywords):
+        return {"tool_name": "stats_tool", "tool_params": {"data": ""}}
+    return None
+
+
+def _default_params(tool_name: str, query: str) -> dict:
+    """返回工具的默认参数"""
+    defaults = {
+        "erp_query_tool": {"query": query},
+        "knowledge_tool": {"query": query, "kb_ids": None, "top_k": 5},
+        "stats_tool": {"data": ""},
+        "doc_process_tool": {"file_ids": [], "operation": "analyze", "instruction": query},
+    }
+    return defaults.get(tool_name, {})
+
 
 SYSTEM_PROMPT = """你是电镀行业SaaS ERP系统的智能助理"智镀云AI"，服务于电镀企业的管理人员和操作人员。
 
@@ -30,7 +110,7 @@ SYSTEM_PROMPT = """你是电镀行业SaaS ERP系统的智能助理"智镀云AI"�
 - 权限摘要: {permissions_summary}
 
 重要安全规则：
-- 用户只能查询和操作本租户（tenant_id={tenant_id}）范围内的数据
+- {tenant_rule}
 - 用户的数据权限级别为 {data_scope}，不得越权
 - {permissions_summary}，超出能力范围的操作应明确拒绝
 """
@@ -86,18 +166,44 @@ async def planner_node(state: AgentState, llm, tools: dict = None) -> dict:
         planning_prompt += f"\n用户信息：{memory_summary}\n"
 
     planning_prompt += """
-可用的工具：
-1. erp_query_tool - 业务数据查询（表名、聚合、筛选条件）
-2. stats_tool - 统计数据分析
-3. knowledge_tool - 知识库检索
-4. doc_process_tool - 文档处理
+可用的工具（严格遵守参数名，不要编造额外参数）：
+
+1. erp_query_tool - 业务数据查询
+   参数（仅限以下3个）：
+   - table: string（必填，表名，从数据库Schema中选取）
+   - aggregate: object（可选，{{"func": "count|sum|avg|max|min", "field": "字段名"}}）
+   - filters: object（可选，{{"date_range": ["开始日期","结束日期"], "status": "...", ...}}）
+
+2. knowledge_tool - 知识库检索
+   参数（仅限以下2个）：
+   - query: string（必填，改写后的检索查询）
+   - top_k: int（可选，默认5，返回条数）
+
+3. stats_tool - 统计分析（必须先有数据，不能直接查表）
+   参数（仅限以下3个）：
+   - operation: string（必填，trend|compare|ratio|summary）
+   - data: string（必填，写空字符串""即可，系统会自动注入前序工具的结果）
+   - params: object（可选，{{"group_by": "字段", "sort": "asc|desc", "top_n": 5}}）
+
+4. doc_process_tool - 文档处理（仅当用户上传了文件时使用）
+   参数（仅限以下3个）：
+   - file_ids: list[string]（必填，文件ID列表，系统会自动注入）
+   - operation: string（必填，summarize|compare|extract|translate|analyze）
+   - instruction: string（必填，用户的详细指令）
+
+重要规则：
+- 每个step的params只能包含对应工具声明的参数，禁止添加额外字段
+- stats_tool的data参数必须写空字符串""，系统会自动注入前序工具的结果，禁止写"step1_result"等占位符
+- stats_tool不能直接查询数据库，它的data参数来自前序工具的结果
+- 如果只需要查询数据，不需要加stats_tool步骤
+- 每个工具最多调用一次，不要重复调用同一工具
 
 请制定分步执行计划，输出JSON格式：
-{
+{{
     "steps": [
-        {"step": 1, "action": "描述", "tool": "工具名", "params": {...}}
+        {{"step": 1, "action": "描述", "tool": "工具名", "params": {{...仅限工具声明的参数...}}}}
     ]
-}
+}}
 """
     messages = [
         SystemMessage(content="你是任务规划助手，为ERP数据分析任务制定执行计划。"),
@@ -111,11 +217,87 @@ async def planner_node(state: AgentState, llm, tools: dict = None) -> dict:
     )
 
     try:
-        content = response.content
-        result = json.loads(content)
-        return {"plan_steps": result.get("steps", [])}
-    except (json.JSONDecodeError, AttributeError):
-        return {"plan_steps": []}
+        content = _get_llm_content(response)
+        result = _extract_json(content)
+        if result is None:
+            logger.warning("[planner] 无有效JSON: %r", content[:100] if content else "")
+            return {"plan_steps": [], "plan_confirmed": False}
+        steps = result.get("steps", [])
+        logger.info("[planner] query=%r → %d个步骤: %s", query[:50], len(steps),
+                     [s.get("tool", "?") for s in steps])
+        return {"plan_steps": steps, "plan_confirmed": False}
+    except (json.JSONDecodeError, AttributeError) as e:
+        raw_content = _get_llm_content(response)
+        logger.warning("[planner] JSON解析失败: %s, raw=%r", e, raw_content[:100] if raw_content else "")
+        return {"plan_steps": [], "plan_confirmed": False}
+
+
+async def _execute_single_tool(
+    tool_name: str, tool_params: dict, tools: dict,
+    user_context, tool_results: list, knowledge_context, references: list,
+    kb_ids=None, file_ids=None, conversation_id=None,
+    _inject_fn=None, _sanitize_fn=None, _merge_fn=None
+) -> dict:
+    """执行单个工具调用并返回结果（提取自 executor_node 的单工具分支）"""
+    import inspect, re as _re
+
+    tool = tools.get(tool_name)
+    if not tool:
+        return {"tool_calls_pending": [], "tool_results": [], "knowledge_context": None, "references": []}
+
+    pending_calls = [{"tool_name": tool_name, "tool_args": tool_params}]
+
+    # 权限检查
+    if hasattr(tool, 'check_permission') and not tool.check_permission(user_context):
+        return {
+            "tool_calls_pending": pending_calls,
+            "tool_results": [{"tool_name": tool_name, "error": "权限不足：您没有使用该工具的权限"}],
+            "knowledge_context": knowledge_context,
+            "references": references
+        }
+
+    # 注入上下文参数
+    if _inject_fn:
+        tool_params = _inject_fn(tool_name, tool_params)
+    # 过滤非法参数
+    if _sanitize_fn:
+        tool_params = _sanitize_fn(tool, tool_params)
+
+    # 执行工具
+    try:
+        tool_result = await tool.execute(**tool_params)
+    except Exception as ex:
+        tool_results.append({"tool_name": tool_name, "error": str(ex)})
+        return {
+            "tool_calls_pending": pending_calls,
+            "tool_results": tool_results,
+            "knowledge_context": knowledge_context,
+            "references": references
+        }
+
+    new_result = {"tool_name": tool_name, "params": tool_params, "result": tool_result}
+    tool_results.append(new_result)
+
+    # Token过期检测
+    if isinstance(tool_result, dict) and tool_result.get("error_code") == 401:
+        return {
+            "tool_calls_pending": pending_calls,
+            "tool_results": tool_results,
+            "knowledge_context": knowledge_context,
+            "references": references,
+            "token_expired": True
+        }
+
+    # 合并工具结果到知识上下文
+    if _merge_fn:
+        _merge_fn(tool_result)
+
+    return {
+        "tool_calls_pending": pending_calls,
+        "tool_results": tool_results,
+        "knowledge_context": knowledge_context,
+        "references": references
+    }
 
 
 async def executor_node(state: AgentState, llm, tools: dict) -> dict:
@@ -131,6 +313,9 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
     knowledge_context = state.get("knowledge_context")
     references = state.get("references", [])
     user_context = state.get("user_context")
+
+    logger.info("[executor] query=%r, plan_steps=%d, available_tools=%s",
+                query[:50], len(plan_steps), list(tools.keys()))
     kb_ids = state.get("kb_ids")
     file_ids = state.get("file_ids")
     conversation_id = state.get("conversation_id")
@@ -138,10 +323,11 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
     def _inject_context_params(tool_name: str, tool_params: dict) -> dict:
         """注入租户隔离和请求上下文参数"""
         params = dict(tool_params)
-        # knowledge_tool：注入tenant_id + kb_ids
+        # knowledge_tool：注入tenant_id + kb_ids + is_platform_admin
         if tool_name == "knowledge_tool":
             if user_context:
                 params.setdefault("tenant_id", user_context.tenant_id)
+                params.setdefault("is_platform_admin", is_platform_admin(user_context))
             if kb_ids and not params.get("kb_ids"):
                 params["kb_ids"] = kb_ids
         # doc_process_tool：注入file_ids + conversation_id
@@ -154,6 +340,16 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
         if tool_name == "erp_query_tool" and user_context:
             pass  # auth_headers已在chat.py中通过set_auth_headers注入
         return params
+
+    def _sanitize_tool_params(tool, params: dict) -> dict:
+        """过滤工具参数：只保留execute()方法声明的参数，丢弃LLM编造的未知参数"""
+        sig = inspect.signature(tool.execute)
+        valid_params = set(sig.parameters.keys()) - {"self"}
+        sanitized = {k: v for k, v in params.items() if k in valid_params}
+        dropped = set(params.keys()) - valid_params
+        if dropped:
+            logger.warning("[executor] 丢弃工具 %s 的非法参数: %s", tool.name, dropped)
+        return sanitized
 
     def _merge_tool_result(tool_result: dict):
         """合并工具返回的引用和知识上下文"""
@@ -170,6 +366,18 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
     # ── 分支1：有执行计划时，按计划逐步执行多个工具 ──
     if plan_steps:
         token_expired = False
+        # 收集即将调用的工具信息（供SSE stream发射tool_start事件）
+        pending_calls = []
+        for step in plan_steps:
+            tool_name = step.get("tool")
+            if tool_name and tools.get(tool_name):
+                pending_calls.append({
+                    "tool_name": tool_name,
+                    "tool_args": step.get("params", {})
+                })
+        # 提前写入state，让chat_stream_generator能检测到并发射tool_start事件
+        # （LangGraph updates模式在节点完成后才捕获，但总比不发射好）
+
         for step in plan_steps:
             tool_name = step.get("tool")
             if not tool_name:
@@ -189,6 +397,32 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
 
             tool_params = _inject_context_params(tool_name, step.get("params", {}))
 
+            # stats_tool：自动注入前序工具结果作为data参数
+            # 触发条件：data为空 OR data是step引用占位符（如 "step1_result"、"step_1"）
+            _data_val = tool_params.get("data", "")
+            _is_placeholder = (
+                not _data_val
+                or _data_val == ""
+                or re.match(r'^step[_\d]*[_]?result$', str(_data_val), re.IGNORECASE) is not None
+            )
+            if tool_name == "stats_tool" and _is_placeholder:
+                logger.info("[executor] stats_tool data=%r 识别为占位符，注入前序工具结果", _data_val)
+                # 从已完成的工具结果中提取最后一个成功的content作为data
+                injected = False
+                for prev in reversed(tool_results):
+                    if "result" in prev and "error" not in prev:
+                        prev_result = prev["result"]
+                        if isinstance(prev_result, dict):
+                            tool_params["data"] = prev_result.get("content", str(prev_result))
+                        else:
+                            tool_params["data"] = str(prev_result)
+                        injected = True
+                        break
+                if not injected:
+                    logger.warning("[executor] stats_tool 无前序工具结果可注入")
+
+            tool_params = _sanitize_tool_params(tool, tool_params)
+
             try:
                 tool_result = await tool.execute(**tool_params)
             except Exception as e:
@@ -206,6 +440,7 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
             _merge_tool_result(tool_result)
 
         return {
+            "tool_calls_pending": pending_calls,
             "tool_results": tool_results,
             "knowledge_context": knowledge_context,
             "references": references,
@@ -280,28 +515,38 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
     )
 
     try:
-        content = response.content
-        # 提取JSON
-        start = content.find("{")
-        end = content.rfind("}") + 1
-        if start >= 0 and end > start:
-            result = json.loads(content[start:end])
-        else:
-            return {"tool_calls_pending": [], "tool_results": [], "knowledge_context": None, "references": []}
+        content = _get_llm_content(response)
+        result = _extract_json(content)
+        if result is None:
+            # ── JSON提取失败，尝试从原始文本中智能推断工具名 ──
+            logger.warning("[executor] LLM返回无有效JSON: %r", content[:200])
+            inferred = _infer_tool_from_text(content, tools, query)
+            if inferred:
+                logger.info("[executor] 从文本推断工具: %s", inferred["tool_name"])
+                result = inferred
+            else:
+                return {"tool_calls_pending": [], "tool_results": [], "knowledge_context": None, "references": []}
 
         tool_name = result.get("tool_name")
         if not tool_name:
-            return {}
+            reason = result.get("reason", "")
+            logger.info("[executor] 无需调用工具: reason=%s", reason)
+            return {"tool_calls_pending": [], "tool_results": [], "knowledge_context": None, "references": []}
 
         tool_params = result.get("tool_params", {})
         tool = tools.get(tool_name)
+        logger.info("[executor] 选择工具: %s, params=%s", tool_name, list(tool_params.keys()))
 
         if not tool:
-            return {}
+            return {"tool_calls_pending": [], "tool_results": [], "knowledge_context": None, "references": []}
+
+        # 收集即将调用的工具信息（供SSE stream发射tool_start事件）
+        pending_calls = [{"tool_name": tool_name, "tool_args": tool_params}]
 
         # 权限检查：工具级别守卫
         if hasattr(tool, 'check_permission') and not tool.check_permission(user_context):
             return {
+                "tool_calls_pending": pending_calls,
                 "tool_results": [{
                     "tool_name": tool_name,
                     "error": "权限不足：您没有使用该工具的权限"
@@ -312,6 +557,7 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
 
         # 注入上下文参数（租户隔离、kb_ids、file_ids）
         tool_params = _inject_context_params(tool_name, tool_params)
+        tool_params = _sanitize_tool_params(tool, tool_params)
 
         # 执行工具
         tool_result = await tool.execute(**tool_params)
@@ -326,6 +572,7 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
         # 检测Token过期（Python→Java返回401）→ 不合并结果，直接通知前端
         if isinstance(tool_result, dict) and tool_result.get("error_code") == 401:
             return {
+                "tool_calls_pending": pending_calls,
                 "tool_results": tool_results,
                 "knowledge_context": knowledge_context,
                 "references": references,
@@ -335,14 +582,30 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
         _merge_tool_result(tool_result)
 
         return {
+            "tool_calls_pending": pending_calls,
             "tool_results": tool_results,
             "knowledge_context": knowledge_context,
             "references": references
         }
 
     except (json.JSONDecodeError, AttributeError) as e:
+        raw_content = _get_llm_content(response)
+        logger.warning("[executor] JSON解析失败: %s, raw=%r", e, raw_content[:200] if raw_content else "")
+        # ── 尝试从原始文本智能推断工具名并执行 ──
+        inferred = _infer_tool_from_text(raw_content, tools, query) if raw_content else None
+        if inferred:
+            logger.info("[executor] JSON异常后从文本推断工具: %s", inferred["tool_name"])
+            return await _execute_single_tool(
+                inferred["tool_name"], inferred.get("tool_params", {}),
+                tools, user_context, tool_results, knowledge_context, references,
+                kb_ids, file_ids, conversation_id,
+                _inject_fn=_inject_context_params,
+                _sanitize_fn=_sanitize_tool_params,
+                _merge_fn=_merge_tool_result
+            )
         return {
-            "tool_results": [{"error": str(e)}],
+            "tool_calls_pending": [],
+            "tool_results": [{"tool_name": "tool_selector", "error": f"工具选择JSON解析失败: {e}"}],
             "knowledge_context": None,
             "references": []
         }
@@ -363,6 +626,19 @@ async def aggregator_node(state: AgentState, llm) -> dict:
             "final_response": "认证已过期，请重新登录",
             "token_usage": {"input": 0, "output": 0},
             "token_expired": True
+        }
+
+    # Plan未确认：直接返回计划摘要，等待用户确认后再执行
+    plan_steps = state.get("plan_steps", [])
+    if plan_steps and not state.get("plan_confirmed"):
+        steps_text = "\n".join([
+            f"{i+1}. [{s.get('tool', '?')}] {s.get('action', '')}"
+            for i, s in enumerate(plan_steps)
+        ])
+        return {
+            "final_response": f"已为您制定执行计划：\n{steps_text}\n\n请确认是否执行该计划？",
+            "token_usage": {"input": 0, "output": 0},
+            "plan_only": True
         }
 
     query = state["query"]
@@ -390,13 +666,20 @@ async def aggregator_node(state: AgentState, llm) -> dict:
     knowledge_context_combined = "\n\n".join(context_parts) if context_parts else None
 
     # ── 构建 System Prompt（含长期记忆） ──
+    # 平台管理员可跨租户访问，普通用户限定本租户
+    if is_platform_admin(user_context):
+        tenant_rule = "当前用户为平台管理员，可跨租户访问所有数据，但仍需遵守数据权限规则"
+    else:
+        tenant_rule = f"用户只能查询和操作本租户（tenant_id={user_context.tenant_id}）范围内的数据"
+
     system_prompt = SYSTEM_PROMPT.format(
         tenant_id=user_context.tenant_id,
         user_id=user_context.user_id,
         username=user_context.username or "",
         nickname=user_context.nickname or user_context.username or "用户",
         data_scope=user_context.data_scope or "NONE",
-        permissions_summary=describe_permissions(user_context)
+        permissions_summary=describe_permissions(user_context),
+        tenant_rule=tenant_rule
     )
 
     if memory_summary:
@@ -441,7 +724,7 @@ async def aggregator_node(state: AgentState, llm) -> dict:
             "error": str(e)
         }
 
-    final_response = response.content
+    final_response = _get_llm_content(response)
 
     # Token用量：优先使用模型返回的实际值（usage_metadata），否则估算
     token_usage = {}
@@ -482,7 +765,7 @@ async def generate_conversation_title(first_message: str, llm) -> str:
             temperature=settings.TITLE_GEN_TEMPERATURE,
             max_tokens=settings.TITLE_GEN_MAX_TOKENS
         )
-        title = response.content.strip()
+        title = _get_llm_content(response).strip()
         # 截断到上限
         max_len = settings.CONVERSATION_TITLE_MAX_LENGTH
         if len(title) > max_len:

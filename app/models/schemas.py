@@ -31,6 +31,8 @@ class ChatRequest(BaseModel):
     conversation_id: Optional[int] = Field(None, description="会话ID，为空则创建新会话")
     kb_ids: Optional[list[int]] = Field(None, description="指定知识库ID列表")
     file_ids: Optional[list[str]] = Field(None, description="上传的临时文件ID列表")
+    confirmed_plan: Optional[list[dict]] = Field(None, description="用户确认的执行计划（确认后立即执行）")
+    original_query: Optional[str] = Field(None, description="确认plan时的原始用户问题（用于aggregator生成回答上下文）")
 
 
 class ChatResponse(BaseModel):

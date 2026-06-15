@@ -11,7 +11,7 @@ from app.models.schemas import ChatRequest
 from app.services.llm_factory import create_llm
 from app.services.context_manager import compress_history
 from app.services.cache import get_or_set, flush_namespace, CacheNS
-from app.services.permissions import require_perm, AI_PERMS
+from app.services.permissions import require_perm, AI_PERMS, is_platform_admin
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -24,10 +24,14 @@ _CONV_LIST_TTL = 120  # 会话列表缓存2分钟
 
 async def get_or_create_conversation(
     db_pool, tenant_id: int, user_id: int,
-    conversation_id: int | None
+    conversation_id: int | None,
+    is_admin: bool = False
 ) -> tuple[int, bool]:
     """
     获取或创建会话
+
+    Args:
+        is_admin: 平台管理员时跳过租户隔离，可跨租户访问
 
     Returns:
         (conversation_id, is_new)
@@ -35,12 +39,20 @@ async def get_or_create_conversation(
     async with db_pool.acquire() as conn:
         # 尝试获取已有会话
         if conversation_id:
-            row = await conn.fetchrow(
-                """SELECT id, message_count FROM conversation
-                   WHERE id = $1 AND user_id = $2 AND tenant_id = $3
-                     AND is_deleted = FALSE""",
-                conversation_id, user_id, tenant_id
-            )
+            if is_admin:
+                # 平台管理员：跨租户查找（仅按id查找）
+                row = await conn.fetchrow(
+                    """SELECT id, message_count FROM conversation
+                       WHERE id = $1 AND is_deleted = FALSE""",
+                    conversation_id
+                )
+            else:
+                row = await conn.fetchrow(
+                    """SELECT id, message_count FROM conversation
+                       WHERE id = $1 AND user_id = $2 AND tenant_id = $3
+                         AND is_deleted = FALSE""",
+                    conversation_id, user_id, tenant_id
+                )
             if row:
                 return row["id"], False
 
@@ -57,21 +69,12 @@ async def get_or_create_conversation(
         return new_id, True
 
 
-async def persist_messages(
+async def persist_user_message(
     db_pool, conversation_id: int, tenant_id: int, user_id: int,
-    query: str, full_response: str, references: list,
-    token_usage: dict, model_name: str,
-    thinking_steps: list = None,
-    duration_sec: float = None
-) -> int:
-    """持久化用户消息和AI回复到conversation_message表
-
-    Returns:
-        AI回复消息的ID
-    """
-    ai_message_id = None
+    query: str
+) -> None:
+    """仅持久化用户消息（用于plan_pending场景：plan不是正式答案，不入库）"""
     async with db_pool.acquire() as conn:
-        # 写入用户消息
         await conn.execute(
             """INSERT INTO conversation_message
                (conversation_id, tenant_id, role, content,
@@ -80,6 +83,46 @@ async def persist_messages(
             conversation_id, tenant_id, query,
             len(query) // 2, user_id
         )
+        await conn.execute(
+            """UPDATE conversation
+               SET message_count = message_count + 1,
+                   last_message_at = NOW(),
+                   updated_by = $2,
+                   updated_at = NOW()
+               WHERE id = $1""",
+            conversation_id, user_id
+        )
+    await flush_namespace(CacheNS.CONV_LIST)
+
+
+async def persist_messages(
+    db_pool, conversation_id: int, tenant_id: int, user_id: int,
+    query: str, full_response: str, references: list,
+    token_usage: dict, model_name: str,
+    thinking_steps: list = None,
+    duration_sec: float = None,
+    skip_user_message: bool = False
+) -> int:
+    """持久化用户消息和AI回复到conversation_message表
+
+    Args:
+        skip_user_message: True时跳过用户消息写入（用于plan确认场景，"确认执行计划"不需要落库）
+
+    Returns:
+        AI回复消息的ID
+    """
+    ai_message_id = None
+    async with db_pool.acquire() as conn:
+        if not skip_user_message:
+            # 写入用户消息
+            await conn.execute(
+                """INSERT INTO conversation_message
+                   (conversation_id, tenant_id, role, content,
+                    token_count, created_by, created_at, updated_at)
+                   VALUES ($1, $2, 'user', $3, $4, $5, NOW(), NOW())""",
+                conversation_id, tenant_id, query,
+                len(query) // 2, user_id
+            )
 
         # 写入AI回复
         ai_message_id = await conn.fetchval(
@@ -100,15 +143,16 @@ async def persist_messages(
 
         # 更新会话元数据
         total_new_tokens = (token_usage or {}).get("input", 0) + (token_usage or {}).get("output", 0)
+        msg_count_increment = 1 if skip_user_message else 2
         await conn.execute(
             """UPDATE conversation
-               SET message_count = message_count + 2,
-                   total_tokens = total_tokens + $2,
+               SET message_count = message_count + $2,
+                   total_tokens = total_tokens + $3,
                    last_message_at = NOW(),
-                   updated_by = $3,
+                   updated_by = $4,
                    updated_at = NOW()
                WHERE id = $1""",
-            conversation_id, total_new_tokens, user_id
+            conversation_id, msg_count_increment, total_new_tokens, user_id
         )
 
     await flush_namespace(CacheNS.CONV_LIST)
@@ -146,7 +190,7 @@ async def _generate_and_save_title(
         # 创建专用标题生成LLM：低温度、无需思考和流式
         from app.services.llm_factory import create_chat_llm
         from langchain_core.messages import HumanMessage
-        from app.agent.nodes import TITLE_GENERATION_PROMPT
+        from app.agent.nodes import TITLE_GENERATION_PROMPT, _get_llm_content
 
         title_llm = create_chat_llm(
             temperature=settings.TITLE_GEN_TEMPERATURE,
@@ -157,7 +201,9 @@ async def _generate_and_save_title(
 
         prompt = TITLE_GENERATION_PROMPT.format(first_message=first_message)
         response = await title_llm.ainvoke([HumanMessage(content=prompt)])
-        title = response.content.strip() if response.content else None
+        # 防御性提取：兼容思考模式content为空的情况
+        raw_content = _get_llm_content(response)
+        title = raw_content.strip() if raw_content else None
 
         if not title:
             logger.warning("[标题生成] LLM返回空content，使用fallback")
@@ -224,7 +270,9 @@ async def chat_stream_generator(
     memory_service,
     chat_llm,
     kb_ids: list[int] | None = None,
-    file_ids: list[str] | None = None
+    file_ids: list[str] | None = None,
+    confirmed_plan: list[dict] | None = None,
+    original_query: str | None = None
 ):
     """
     SSE流式生成器 - 有状态多轮对话版本
@@ -243,9 +291,10 @@ async def chat_stream_generator(
 
     try:
         # ── 步骤1：获取或创建会话 ──
+        admin_mode = is_platform_admin(user_context)
         conversation_id, is_new = await get_or_create_conversation(
             db_pool, user_context.tenant_id, user_context.user_id,
-            conversation_id
+            conversation_id, is_admin=admin_mode
         )
 
         # ── 步骤2：加载长期记忆（注入System Prompt） ──
@@ -268,16 +317,20 @@ async def chat_stream_generator(
         from app.agent.state import AgentState
         from langchain_core.messages import HumanMessage
 
+        # 确认plan时：使用原始用户问题作为query（而非"确认执行计划"），让aggregator有正确上下文
+        effective_query = original_query if (confirmed_plan and original_query) else query
+
         initial_state: AgentState = {
-            "messages": [HumanMessage(content=query)],
-            "query": query,
+            "messages": [HumanMessage(content=effective_query)],
+            "query": effective_query,
             "user_context": user_context,
             "conversation_id": conversation_id,
             "kb_ids": kb_ids,
             "file_ids": file_ids,
             "task_complexity": "simple",
             "requires_confirmation": False,
-            "plan_steps": [],
+            "plan_steps": confirmed_plan or [],
+            "plan_confirmed": bool(confirmed_plan),
             "tool_calls_pending": [],
             "tool_results": [],
             "knowledge_context": None,
@@ -310,6 +363,7 @@ async def chat_stream_generator(
         step_start = time.time()
         fallback_content = ""  # 从节点更新中提取的兜底内容
         chunk_count = 0  # 统计接收的 chunk 数量
+        captured_plan_steps = []  # 从planner节点输出中捕获的plan步骤
 
         # ── 思考内容按节点拼接缓冲区 ──
         # reasoning_content 逐chunk返回前端（实时），但落库时按节点合并为一个thinking条目
@@ -387,6 +441,7 @@ async def chat_stream_generator(
                 # 节点状态更新 - 提取工具调用、计划和引用
                 for node_name, node_output in chunk["data"].items():
                     if isinstance(node_output, dict):
+                        logger.info("[SSE] 节点 %s 输出keys: %s", node_name, list(node_output.keys()))
                         # 检测Token过期标记（Python→Java返回401，全局处理）
                         if node_output.get("token_expired"):
                             token_expired_detected = True
@@ -394,6 +449,7 @@ async def chat_stream_generator(
                         # 提取执行计划（planner节点输出）
                         if "plan_steps" in node_output and node_output["plan_steps"]:
                             plan_steps_data = node_output["plan_steps"]
+                            captured_plan_steps = plan_steps_data  # 捕获用于plan_pending判定
                             # flush当前节点的思考缓冲区（planner开始，新的思考阶段）
                             _flush_thinking_node()
                             ts = round(time.time() - step_start, 1)
@@ -428,6 +484,50 @@ async def chat_stream_generator(
                                         "step_index": 0
                                     }, ensure_ascii=False)
                                 }
+
+                        # 提取工具执行结果 → 发射tool_end/tool_error事件
+                        if "tool_results" in node_output and node_output["tool_results"]:
+                            for tr in node_output["tool_results"]:
+                                tool_name = tr.get("tool_name", "unknown")
+                                ts = round(time.time() - step_start, 1)
+                                if "error" in tr:
+                                    # 工具执行失败（权限不足、异常等）
+                                    error_msg = tr["error"]
+                                    thinking_steps.append({
+                                        "type": "tool_end",
+                                        "content": f"{tool_name} 失败: {error_msg}",
+                                        "toolName": tool_name,
+                                        "timestamp": ts
+                                    })
+                                    yield {
+                                        "event": "tool_error",
+                                        "data": json.dumps({
+                                            "tool_name": tool_name,
+                                            "error_msg": error_msg,
+                                            "step_index": 0
+                                        }, ensure_ascii=False)
+                                    }
+                                else:
+                                    # 工具执行成功 → 提取摘要
+                                    result_data = tr.get("result", {})
+                                    if isinstance(result_data, dict):
+                                        summary = result_data.get("content", str(result_data))[:100]
+                                    else:
+                                        summary = str(result_data)[:100]
+                                    thinking_steps.append({
+                                        "type": "tool_end",
+                                        "content": f"{tool_name}: {summary}",
+                                        "toolName": tool_name,
+                                        "timestamp": ts
+                                    })
+                                    yield {
+                                        "event": "tool_end",
+                                        "data": json.dumps({
+                                            "tool_name": tool_name,
+                                            "result_summary": summary,
+                                            "step_index": 0
+                                        }, ensure_ascii=False)
+                                    }
                         
                         # 提取引用（去重：只发送本轮新增的引用，避免aggregator透传state导致前端重复展示）
                         if "references" in node_output and node_output["references"]:
@@ -446,7 +546,7 @@ async def chat_stream_generator(
                         if "final_response" in node_output and node_output["final_response"] and not full_response:
                             fallback_content = node_output["final_response"]
 
-        # ── 步骤7：持久化消息到数据库 ──
+        # ── 步骤7：检测plan_pending（Plan是中间态，不落库） ──
         # 最后flush：确保尾部思考内容不丢失
         _flush_thinking_node()
         
@@ -468,28 +568,47 @@ async def chat_stream_generator(
             "[SSE] 流式生成完成: chunks=%d, full_response_len=%d, thinking_steps=%d, duration=%.1fs",
             chunk_count, len(full_response), len(thinking_steps), duration_sec
         )
-        ai_message_id = await persist_messages(
-            db_pool, conversation_id, user_context.tenant_id,
-            user_context.user_id, query, full_response,
-            references, token_usage, settings.LLM_MODEL_CHAT,
-            thinking_steps=thinking_steps,
-            duration_sec=duration_sec
-        )
 
-        # ── 步骤8：新会话同步生成标题 ──
+        # ── 检测plan_pending：plan不是正式答案，只通过SSE实时展示，不落库 ──
+        plan_pending = False
+        # 判定条件：无正文chunk + 兜底内容含"执行计划" + 从planner捕获了plan步骤且未确认
+        if not chunk_count and fallback_content and "执行计划" in fallback_content and captured_plan_steps:
+            plan_pending = True
+
+        ai_message_id = None
         conversation_title = None
+
+        if plan_pending:
+            # ── Plan模式：仅保存用户消息，plan不落库 ──
+            logger.info("[SSE] plan_pending=True，仅保存用户消息，plan不入库")
+            await persist_user_message(
+                db_pool, conversation_id, user_context.tenant_id,
+                user_context.user_id, query
+            )
+        else:
+            # ── 正常模式：保存用户消息 + AI回复 ──
+            ai_message_id = await persist_messages(
+                db_pool, conversation_id, user_context.tenant_id,
+                user_context.user_id, query, full_response,
+                references, token_usage, settings.LLM_MODEL_CHAT,
+                thinking_steps=thinking_steps,
+                duration_sec=duration_sec,
+                skip_user_message=bool(confirmed_plan)  # plan确认时不存"确认执行计划"
+            )
+
+            # ── 步骤9：异步记忆提取 ──
+            if memory_service and settings.MEM0_ENABLED:
+                asyncio.create_task(
+                    extract_long_term_memory(
+                        memory_service, user_context.tenant_id,
+                        user_context.user_id, query, full_response
+                    )
+                )
+
+        # ── 步骤8：新会话同步生成标题（plan_pending 也需要生成）──
         if is_new:
             conversation_title = await _generate_and_save_title(
                 db_pool, conversation_id, query, chat_llm
-            )
-
-        # ── 步骤9：异步记忆提取 ──
-        if memory_service and settings.MEM0_ENABLED:
-            asyncio.create_task(
-                extract_long_term_memory(
-                    memory_service, user_context.tenant_id,
-                    user_context.user_id, query, full_response
-                )
             )
 
         # ── 步骤10：如果检测到Token过期，先发token_expired事件再发done ──
@@ -509,8 +628,12 @@ async def chat_stream_generator(
             "conversation_id": conversation_id,
             "message_id": ai_message_id,
             "duration_sec": duration_sec,
-            "thinking_steps": thinking_steps
+            "thinking_steps": thinking_steps,
+            "plan_pending": plan_pending
         }
+        # Plan pending时：附带plan_steps数据，前端用于展示确认卡片
+        if plan_pending and captured_plan_steps:
+            done_data["plan_steps"] = captured_plan_steps
         if conversation_title:
             done_data["conversation_title"] = conversation_title
         
@@ -575,16 +698,26 @@ async def get_conversation_messages(
     before_id: int = None,
     req: Request = None
 ):
-    """获取会话历史消息（支持游标分页）"""
+    """获取会话历史消息（支持游标分页）
+
+    平台管理员可跨租户查看任意会话消息。
+    """
     pool = req.app.state.db_pool
     user_context = req.state.user_context
+    admin_mode = is_platform_admin(user_context)
 
     async with pool.acquire() as conn:
-        # 校验会话归属
-        conv = await conn.fetchrow(
-            "SELECT id FROM conversation WHERE id = $1 AND user_id = $2 AND tenant_id = $3 AND is_deleted = FALSE",
-            conversation_id, user_context.user_id, user_context.tenant_id
-        )
+        # 校验会话归属（平台管理员跳过租户校验）
+        if admin_mode:
+            conv = await conn.fetchrow(
+                "SELECT id FROM conversation WHERE id = $1 AND is_deleted = FALSE",
+                conversation_id
+            )
+        else:
+            conv = await conn.fetchrow(
+                "SELECT id FROM conversation WHERE id = $1 AND user_id = $2 AND tenant_id = $3 AND is_deleted = FALSE",
+                conversation_id, user_context.user_id, user_context.tenant_id
+            )
         if not conv:
             from fastapi import HTTPException
             raise HTTPException(status_code=404, detail="会话不存在")
@@ -634,10 +767,14 @@ async def rename_conversation(
     conversation_id: int,
     req: Request = None
 ):
-    """修改会话名称"""
+    """修改会话名称
+
+    平台管理员可跨租户修改任意会话名称。
+    """
     from fastapi import HTTPException
     pool = req.app.state.db_pool
     user_context = req.state.user_context
+    admin_mode = is_platform_admin(user_context)
 
     body = await req.json()
     title = (body.get("title") or "").strip()
@@ -647,11 +784,17 @@ async def rename_conversation(
         title = title[:50]
 
     async with pool.acquire() as conn:
-        # 校验归属
-        exists = await conn.fetchval(
-            "SELECT id FROM conversation WHERE id = $1 AND user_id = $2 AND tenant_id = $3 AND is_deleted = FALSE",
-            conversation_id, user_context.user_id, user_context.tenant_id
-        )
+        # 校验归属（平台管理员跳过租户校验）
+        if admin_mode:
+            exists = await conn.fetchval(
+                "SELECT id FROM conversation WHERE id = $1 AND is_deleted = FALSE",
+                conversation_id
+            )
+        else:
+            exists = await conn.fetchval(
+                "SELECT id FROM conversation WHERE id = $1 AND user_id = $2 AND tenant_id = $3 AND is_deleted = FALSE",
+                conversation_id, user_context.user_id, user_context.tenant_id
+            )
         if not exists:
             raise HTTPException(status_code=404, detail="会话不存在")
 
@@ -669,17 +812,27 @@ async def delete_conversation(
     conversation_id: int,
     req: Request = None
 ):
-    """软删除会话"""
+    """软删除会话
+
+    平台管理员可跨租户删除任意会话。
+    """
     from fastapi import HTTPException
     pool = req.app.state.db_pool
     user_context = req.state.user_context
+    admin_mode = is_platform_admin(user_context)
 
     async with pool.acquire() as conn:
-        # 校验归属
-        exists = await conn.fetchval(
-            "SELECT id FROM conversation WHERE id = $1 AND user_id = $2 AND tenant_id = $3 AND is_deleted = FALSE",
-            conversation_id, user_context.user_id, user_context.tenant_id
-        )
+        # 校验归属（平台管理员跳过租户校验）
+        if admin_mode:
+            exists = await conn.fetchval(
+                "SELECT id FROM conversation WHERE id = $1 AND is_deleted = FALSE",
+                conversation_id
+            )
+        else:
+            exists = await conn.fetchval(
+                "SELECT id FROM conversation WHERE id = $1 AND user_id = $2 AND tenant_id = $3 AND is_deleted = FALSE",
+                conversation_id, user_context.user_id, user_context.tenant_id
+            )
         if not exists:
             raise HTTPException(status_code=404, detail="会话不存在")
 
@@ -738,7 +891,9 @@ async def chat(request: ChatRequest, req: Request):
             memory_service=memory_service,
             chat_llm=chat_llm,
             kb_ids=request.kb_ids,
-            file_ids=request.file_ids
+            file_ids=request.file_ids,
+            confirmed_plan=request.confirmed_plan,
+            original_query=request.original_query
         ),
         media_type="text/event-stream"
     )

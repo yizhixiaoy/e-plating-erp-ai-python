@@ -22,6 +22,7 @@ class AgentState(TypedDict):
 
     # 执行计划
     plan_steps: Optional[list[dict]]
+    plan_confirmed: bool                      # 用户已确认执行计划
 
     # 工具调用与结果
     tool_calls_pending: list[dict]

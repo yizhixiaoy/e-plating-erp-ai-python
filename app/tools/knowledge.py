@@ -52,7 +52,8 @@ class KnowledgeTool(BaseTool):
         query: str,
         kb_ids: list[int] = None,
         top_k: int = None,
-        tenant_id: int = None
+        tenant_id: int = None,
+        is_platform_admin: bool = False
     ) -> dict:
         """执行知识库混合检索
 
@@ -74,7 +75,7 @@ class KnowledgeTool(BaseTool):
 
                 # 构建通用过滤条件
                 kb_filter, tenant_filter, base_params = self._build_filters(
-                    kb_ids, tenant_id
+                    kb_ids, tenant_id, is_platform_admin=is_platform_admin
                 )
 
                 logger.info("[knowledge] 开始检索: query=%r, kb_ids=%s, tenant_id=%s, top_k=%d",
@@ -195,10 +196,12 @@ class KnowledgeTool(BaseTool):
                 "references": []
             }
 
-    def _build_filters(self, kb_ids: list[int] = None, tenant_id: int = None) -> tuple:
+    def _build_filters(self, kb_ids: list[int] = None, tenant_id: int = None,
+                       is_platform_admin: bool = False) -> tuple:
         """构建SQL过滤条件，返回 (kb_filter, tenant_filter, params)
         
         权限逻辑：
+        - is_platform_admin=True：平台管理员，检索所有知识库（跨租户）
         - tenant_id is None：未知租户状态，仅检索全局库（安全保守策略）
         - tenant_id == 0：访客模式，仅检索全局库
         - tenant_id > 0：登录用户，检索全局库 + 租户库
@@ -214,7 +217,10 @@ class KnowledgeTool(BaseTool):
             param_idx += 1
 
         tenant_filter = ""
-        if tenant_id is None:
+        if is_platform_admin:
+            # 平台管理员：不限制租户，可检索所有知识库
+            pass
+        elif tenant_id is None:
             # 未指定租户ID（安全保守策略）：仅检索全局库
             tenant_filter = "AND kb.scope_type = 'global'"
         elif tenant_id == 0:
