@@ -69,32 +69,6 @@ async def get_or_create_conversation(
         return new_id, True
 
 
-async def persist_user_message(
-    db_pool, conversation_id: int, tenant_id: int, user_id: int,
-    query: str
-) -> None:
-    """仅持久化用户消息（用于plan_pending场景：plan不是正式答案，不入库）"""
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO conversation_message
-               (conversation_id, tenant_id, role, content,
-                token_count, created_by, created_at, updated_at)
-               VALUES ($1, $2, 'user', $3, $4, $5, NOW(), NOW())""",
-            conversation_id, tenant_id, query,
-            len(query) // 2, user_id
-        )
-        await conn.execute(
-            """UPDATE conversation
-               SET message_count = message_count + 1,
-                   last_message_at = NOW(),
-                   updated_by = $2,
-                   updated_at = NOW()
-               WHERE id = $1""",
-            conversation_id, user_id
-        )
-    await flush_namespace(CacheNS.CONV_LIST)
-
-
 async def persist_messages(
     db_pool, conversation_id: int, tenant_id: int, user_id: int,
     query: str, full_response: str, references: list,
@@ -363,7 +337,6 @@ async def chat_stream_generator(
         step_start = time.time()
         fallback_content = ""  # 从节点更新中提取的兜底内容
         chunk_count = 0  # 统计接收的 chunk 数量
-        captured_plan_steps = []  # 从planner节点输出中捕获的plan步骤
 
         # ── 思考内容按节点拼接缓冲区 ──
         # reasoning_content 逐chunk返回前端（实时），但落库时按节点合并为一个thinking条目
@@ -446,21 +419,26 @@ async def chat_stream_generator(
                         if node_output.get("token_expired"):
                             token_expired_detected = True
 
-                        # 提取执行计划（planner节点输出）
+                        # 提取执行计划（planner节点输出） → 以thinking事件发射，包含plan详情
                         if "plan_steps" in node_output and node_output["plan_steps"]:
                             plan_steps_data = node_output["plan_steps"]
-                            captured_plan_steps = plan_steps_data  # 捕获用于plan_pending判定
-                            # flush当前节点的思考缓冲区（planner开始，新的思考阶段）
                             _flush_thinking_node()
                             ts = round(time.time() - step_start, 1)
+                            plan_summary = f"已规划{len(plan_steps_data)}个执行步骤"
                             thinking_steps.append({
                                 "type": "plan",
-                                "content": f"已规划{len(plan_steps_data)}个执行步骤",
+                                "content": plan_summary,
+                                "plan_steps": plan_steps_data,
                                 "timestamp": ts
                             })
+                            # 携带plan_steps详情，前端可渲染可展开的plan详情
                             yield {
-                                "event": "plan",
-                                "data": json.dumps({"steps": plan_steps_data}, ensure_ascii=False)
+                                "event": "thinking",
+                                "data": json.dumps({
+                                    "content": plan_summary,
+                                    "plan_steps": plan_steps_data,
+                                    "is_plan": True
+                                }, ensure_ascii=False)
                             }
 
                         # 提取工具调用信息
@@ -546,8 +524,7 @@ async def chat_stream_generator(
                         if "final_response" in node_output and node_output["final_response"] and not full_response:
                             fallback_content = node_output["final_response"]
 
-        # ── 步骤7：检测plan_pending（Plan是中间态，不落库） ──
-        # 最后flush：确保尾部思考内容不丢失
+        # ── 最后flush：确保尾部思考内容不丢失 ──
         _flush_thinking_node()
         
         # ── 兜底：如果流式未捕获到正文，使用 on_chat_model_end / on_chain_end 的内容 ──
@@ -569,56 +546,41 @@ async def chat_stream_generator(
             chunk_count, len(full_response), len(thinking_steps), duration_sec
         )
 
-        # ── 检测plan_pending：plan不是正式答案，只通过SSE实时展示，不落库 ──
-        plan_pending = False
-        # 判定条件：无正文chunk + 兜底内容含"执行计划" + 从planner捕获了plan步骤且未确认
-        if not chunk_count and fallback_content and "执行计划" in fallback_content and captured_plan_steps:
-            plan_pending = True
-
         ai_message_id = None
         conversation_title = None
 
-        if plan_pending:
-            # ── Plan模式：仅保存用户消息，plan不落库 ──
-            logger.info("[SSE] plan_pending=True，仅保存用户消息，plan不入库")
-            await persist_user_message(
-                db_pool, conversation_id, user_context.tenant_id,
-                user_context.user_id, query
-            )
-        else:
-            # ── 正常模式：保存用户消息 + AI回复 ──
-            ai_message_id = await persist_messages(
-                db_pool, conversation_id, user_context.tenant_id,
-                user_context.user_id, query, full_response,
-                references, token_usage, settings.LLM_MODEL_CHAT,
-                thinking_steps=thinking_steps,
-                duration_sec=duration_sec,
-                skip_user_message=bool(confirmed_plan)  # plan确认时不存"确认执行计划"
-            )
+        # ── 正常模式：保存用户消息 + AI回复（plan已作为thinking steps落库）──
+        ai_message_id = await persist_messages(
+            db_pool, conversation_id, user_context.tenant_id,
+            user_context.user_id, query, full_response,
+            references, token_usage, settings.LLM_MODEL_CHAT,
+            thinking_steps=thinking_steps,
+            duration_sec=duration_sec
+        )
 
-            # ── 步骤9：异步记忆提取 ──
-            if memory_service and settings.MEM0_ENABLED:
-                asyncio.create_task(
-                    extract_long_term_memory(
-                        memory_service, user_context.tenant_id,
-                        user_context.user_id, query, full_response
-                    )
+        # ── 异步记忆提取 ──
+        if memory_service and settings.MEM0_ENABLED:
+            asyncio.create_task(
+                extract_long_term_memory(
+                    memory_service, user_context.tenant_id,
+                    user_context.user_id, query, full_response
                 )
+            )
 
-        # ── 步骤8：新会话同步生成标题（plan_pending 也需要生成）──
+        # ── 新会话同步生成标题 ──
         if is_new:
             conversation_title = await _generate_and_save_title(
                 db_pool, conversation_id, query, chat_llm
             )
 
-        # ── 步骤10：如果检测到Token过期，先发token_expired事件再发done ──
+        # ── 如果检测到Token过期，先发token_expired事件再发done ──
         if token_expired_detected:
             yield {
                 "event": "token_expired",
                 "data": json.dumps({"message": "认证已过期，请重新登录"}, ensure_ascii=False)
             }
 
-        # ── 步骤11：发射done事件 ──
+        # ── 发射done事件 ──
         done_data = {
             "full_content": full_response,
             "token_usage": token_usage or {
@@ -628,12 +590,8 @@ async def chat_stream_generator(
             "conversation_id": conversation_id,
             "message_id": ai_message_id,
             "duration_sec": duration_sec,
-            "thinking_steps": thinking_steps,
-            "plan_pending": plan_pending
+            "thinking_steps": thinking_steps
         }
-        # Plan pending时：附带plan_steps数据，前端用于展示确认卡片
-        if plan_pending and captured_plan_steps:
-            done_data["plan_steps"] = captured_plan_steps
         if conversation_title:
             done_data["conversation_title"] = conversation_title
         

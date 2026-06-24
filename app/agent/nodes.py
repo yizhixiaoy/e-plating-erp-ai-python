@@ -225,11 +225,11 @@ async def planner_node(state: AgentState, llm, tools: dict = None) -> dict:
         steps = result.get("steps", [])
         logger.info("[planner] query=%r → %d个步骤: %s", query[:50], len(steps),
                      [s.get("tool", "?") for s in steps])
-        return {"plan_steps": steps, "plan_confirmed": False}
+        return {"plan_steps": steps, "plan_confirmed": True}
     except (json.JSONDecodeError, AttributeError) as e:
         raw_content = _get_llm_content(response)
         logger.warning("[planner] JSON解析失败: %s, raw=%r", e, raw_content[:100] if raw_content else "")
-        return {"plan_steps": [], "plan_confirmed": False}
+        return {"plan_steps": [], "plan_confirmed": True}
 
 
 async def _execute_single_tool(
@@ -626,19 +626,6 @@ async def aggregator_node(state: AgentState, llm) -> dict:
             "final_response": "认证已过期，请重新登录",
             "token_usage": {"input": 0, "output": 0},
             "token_expired": True
-        }
-
-    # Plan未确认：直接返回计划摘要，等待用户确认后再执行
-    plan_steps = state.get("plan_steps", [])
-    if plan_steps and not state.get("plan_confirmed"):
-        steps_text = "\n".join([
-            f"{i+1}. [{s.get('tool', '?')}] {s.get('action', '')}"
-            for i, s in enumerate(plan_steps)
-        ])
-        return {
-            "final_response": f"已为您制定执行计划：\n{steps_text}\n\n请确认是否执行该计划？",
-            "token_usage": {"input": 0, "output": 0},
-            "plan_only": True
         }
 
     query = state["query"]

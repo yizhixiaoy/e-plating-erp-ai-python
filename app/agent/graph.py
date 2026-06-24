@@ -17,8 +17,7 @@ def build_agent_graph(chat_llm, agent_llm, tools: dict, checkpointer=None):
 
     节点流程：
     classifier → (simple?) → executor → aggregator → END
-              → (medium/complex?) → planner → (plan_confirmed?) → executor → aggregator → END
-                                                                → (未确认)  → aggregator → END（等待用户确认）
+              → (medium/complex?) → planner → executor → aggregator → END
 
     Thinking/Streaming 按节点控制：
     - classifier: thinking=OFF, streaming=OFF（快速分类）
@@ -95,11 +94,10 @@ def build_agent_graph(chat_llm, agent_llm, tools: dict, checkpointer=None):
         }
     )
 
-    # planner → 条件路由（已确认→executor，未确认→aggregator直接结束）
+    # planner → 自动进入executor（plan已自动确认）
     def route_after_planner(state: AgentState) -> str:
-        if state.get("plan_confirmed"):
-            return "executor"
-        return "aggregator"
+        """Plan已自动确认，直接进入执行阶段"""
+        return "executor"
 
     workflow.add_conditional_edges(
         "planner",
