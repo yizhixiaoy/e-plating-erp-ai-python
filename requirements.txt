@@ -15,6 +15,7 @@ langgraph-checkpoint-postgres==3.1.0
 FlagEmbedding==1.4.0
 pgvector==0.3.0
 psycopg2-binary==2.9.10
+psycopg-binary==3.3.4
 asyncpg==0.31.0
 
 # 文档解析（混合切分）

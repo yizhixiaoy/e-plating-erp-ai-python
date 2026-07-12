@@ -17,8 +17,8 @@ class Settings:
     PORT: int = int(os.getenv("PORT", "8000"))
 
     # PostgreSQL
-    PG_HOST: str = os.getenv("PG_HOST", "3.tcp.cpolar.top")
-    PG_PORT: int = int(os.getenv("PG_PORT", "12026"))
+    PG_HOST: str = os.getenv("PG_HOST", "127.0.0.1")
+    PG_PORT: int = int(os.getenv("PG_PORT", "5432"))
     PG_USER: str = os.getenv("PG_USER", "postgres")
     PG_PASSWORD: str = os.getenv("PG_PASSWORD", "postgres")
     PG_DATABASE: str = os.getenv("PG_DATABASE", "erp_ai")
@@ -62,9 +62,9 @@ class Settings:
     JAVA_API_TIMEOUT: int = int(os.getenv("JAVA_API_TIMEOUT", "30"))
 
     # Redis
-    REDIS_HOST: str = os.getenv("REDIS_HOST", "3.tcp.cpolar.top")
-    REDIS_PORT: int = int(os.getenv("REDIS_PORT", "11414"))
-    REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
+    REDIS_HOST: str = os.getenv("REDIS_HOST", "127.0.0.1")
+    REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
+    REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "redis2026")
     REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
     REDIS_PREFIX: str = os.getenv("REDIS_PREFIX", "erp_ai:")
 

@@ -13,7 +13,7 @@ os.environ.setdefault("HF_ENDPOINT", settings.HF_ENDPOINT)
 # Windows 不支持 symlink 缓存，消除重复警告
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
-from app.api import chat, write, knowledge, health, files
+from app.api import chat, write, knowledge, health, files, goods
 from app.middleware.auth import AuthMiddleware
 from app.services.llm_factory import create_chat_llm, create_agent_llm
 from app.services.memory import MemoryService
@@ -185,6 +185,7 @@ app.include_router(write.router)
 app.include_router(knowledge.router)
 app.include_router(files.router)
 app.include_router(files.upload_router)
+app.include_router(goods.router)
 app.include_router(health.router)
 
 
