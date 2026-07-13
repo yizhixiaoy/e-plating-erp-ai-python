@@ -190,18 +190,16 @@ class GoodsImageSearchService:
     async def _download_image(self, session: aiohttp.ClientSession, oss_path: str) -> bytes:
         """从OSS下载图片"""
         try:
-            # 通过Java网关下载图片
-            url = self.oss_service.get_resource_url(oss_path, action="download")
-            # 如果是本地调试，直接从OSS下载
-            from app.config import settings
-            if settings.OSS_ENABLED and settings.OSS_ENDPOINT:
-                full_url = f"https://{settings.OSS_ENDPOINT}/{settings.OSS_BUCKET}/{oss_path}"
-            else:
-                full_url = url  # 通过Java网关
+            # 优先通过oss_service下载（支持多 provider）
+            if self.oss_service and self.oss_service.enabled:
+                return await self.oss_service.download_file(oss_path)
 
-            async with session.get(full_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                if resp.status == 200:
-                    return await resp.read()
+            # 回退：通过Java网关下载
+            url = self.oss_service.get_resource_url(oss_path, action="download") if self.oss_service else ""
+            if url:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status == 200:
+                        return await resp.read()
         except Exception as e:
             logger.warning("[GoodsSearch] 下载图片失败: oss_path=%s, err=%s", oss_path, e)
         return b""

@@ -1,5 +1,6 @@
 """FastAPI入口 - AI助理Python服务"""
 import asyncio
+import logging
 import os
 import asyncpg
 from contextlib import asynccontextmanager
@@ -7,6 +8,21 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+
+# 全局日志配置（必须在其他模块导入之前，确保所有 logger.info 可见）
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S"
+)
+# 抑制 httpx 的大量 HTTP 请求日志（模型加载时每个文件都会打印多次请求）
+logging.getLogger("httpx").setLevel(logging.WARNING)
+# 抑制 huggingface_hub 的下载日志
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+# 抑制 urllib3 连接重试日志（MinIO不可用时大量重试日志会淹没输出）
+logging.getLogger("urllib3").setLevel(logging.ERROR)
+# 抑制 transformers tokenizer 性能提示（XLMRobertaTokenizerFast __call__ 警告）
+logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
 
 # HuggingFace 国内镜像：必须在任何 FlagEmbedding 导入之前设置
 os.environ.setdefault("HF_ENDPOINT", settings.HF_ENDPOINT)
@@ -25,18 +41,29 @@ from app.tools.doc_process import DocProcessTool
 
 
 async def _preload_embedding_model(knowledge_tool: KnowledgeTool):
-    """后台任务：预加载Embedding模型，避免首次查询时长时间阻塞"""
+    """后台任务：预加载Embedding + Reranker模型，避免首次查询时长时间阻塞"""
     try:
         import logging
         logger = logging.getLogger(__name__)
         logger.info("[启动] 开始后台预加载Embedding模型: %s", settings.EMBEDDING_MODEL)
-        # 触发模型的懒加载（_get_query_embedding 内部会初始化模型）
+        # 触发Embedding模型的懒加载
         _ = await knowledge_tool._get_query_embedding("preload warmup")
         logger.info("[启动] Embedding模型预加载完成")
+
+        # 预加载Reranker模型（bge-reranker-v2-m3，首次加载约30-60s）
+        if knowledge_tool.rerank_enabled:
+            logger.info("[启动] 开始后台预加载Reranker模型: %s", settings.RERANK_MODEL)
+            from FlagEmbedding import FlagReranker
+            import time as _t
+            _t0 = _t.time()
+            knowledge_tool.reranker = await asyncio.to_thread(
+                lambda: FlagReranker(settings.RERANK_MODEL, use_fp16=True)
+            )
+            logger.info("[启动] Reranker模型预加载完成: %.1fs", _t.time() - _t0)
     except Exception as e:
         import logging
         logger = logging.getLogger(__name__)
-        logger.error("[启动] Embedding模型预加载失败（首次检索时将重试）: %s", e)
+        logger.error("[启动] 模型预加载失败（首次检索时将重试）: %s", e)
 
 
 @asynccontextmanager
@@ -71,7 +98,7 @@ async def lifespan(app: FastAPI):
 
     # 初始化OSS对象存储服务（与Java后端FileUploadUtils共享bucket）
     app.state.oss_service = OssStorageService()
-    print(f"[OSS] 对象存储: {'已启用' if app.state.oss_service.enabled else '已禁用'}")
+    print(f"[OSS] 对象存储: {'已启用' if app.state.oss_service.enabled else '已禁用'} (provider={app.state.oss_service._provider})")
 
     # 初始化工具
     auth_headers = {}

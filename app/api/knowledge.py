@@ -1,4 +1,7 @@
 """知识库管理接口"""
+import asyncio
+import logging
+from urllib.parse import quote, unquote
 from fastapi import APIRouter, Request, HTTPException, UploadFile, File
 from app.models.schemas import (
     KnowledgeBaseCreate, KnowledgeBaseUpdate,
@@ -7,8 +10,10 @@ from app.models.schemas import (
 from app.config import settings
 from app.services.cache import get_or_set, flush_namespace, CacheNS
 from app.services.permissions import require_perm, require_any_perm, AI_PERMS, is_platform_admin
+from app.services.oss_storage import get_preview_type
 
 router = APIRouter(prefix="/api/ai/knowledge", tags=["知识库管理"])
+logger = logging.getLogger(__name__)
 _KB_LIST_TTL = 300  # 知识库列表缓存5分钟
 
 
@@ -281,7 +286,12 @@ async def search_knowledge(kb_id: int, search_req: KnowledgeSearchRequest, req: 
 
 @router.post("/{kb_id}/documents")
 async def upload_document(kb_id: int, file: UploadFile = File(...), req: Request = None):
-    """上传文档到知识库（校验→OSS备份→解析→切块→向量化→入库）"""
+    """上传文档到知识库（快速返回，后台异步解析）
+
+    流程：
+    1. 同步阶段：校验→保存临时文件→OSS备份→创建DB记录（状态=parsing）→立即返回
+    2. 后台任务：解析→切块→向量化→更新状态
+    """
     from app.services.document_processor import DocumentProcessor
     pool = req.app.state.db_pool
     user_context = req.state.user_context
@@ -317,33 +327,55 @@ async def upload_document(kb_id: int, file: UploadFile = File(...), req: Request
             detail=f"不支持的文件类型: {file_type}，允许: {', '.join(settings.ALLOWED_FILE_TYPES)}"
         )
 
-    # 执行文档处理管道（传入知识库级切分参数 + OSS服务）
+    # 快速上传阶段：保存临时文件 + OSS备份 + 创建DB记录
     processor = DocumentProcessor(db_pool=pool, oss_service=oss_service)
-    result = await processor.process_upload(
+    upload_info = await processor.quick_upload(
         kb_id=kb_id,
         tenant_id=user_context.tenant_id,
         user_id=user_context.user_id,
         file_name=file_name,
         file_content=file_content,
-        file_type=file_type,
-        chunk_size=kb_row["chunk_size"],
-        chunk_overlap=kb_row["chunk_overlap"]
+        file_type=file_type
     )
 
-    if result["status"] == "completed":
-        await flush_namespace(CacheNS.KB_LIST)
-        await flush_namespace(CacheNS.KB_DOC_LIST)
-        return {
-            "message": f"文档处理完成，共切分{result['chunk_count']}个片段",
-            "doc_id": result["doc_id"],
-            "chunk_count": result["chunk_count"],
-            "file_url": result.get("file_url", "")
-        }
-    else:
-        raise HTTPException(
-            status_code=422,
-            detail=f"文档处理失败: {result.get('error', '未知错误')}"
-        )
+    # 启动后台异步解析任务（从OSS下载文件进行解析）
+    async def _background_process():
+        try:
+            await processor.process_in_background(
+                doc_id=upload_info["doc_id"],
+                kb_id=kb_id,
+                tenant_id=user_context.tenant_id,
+                user_id=user_context.user_id,
+                oss_path=upload_info["oss_path"],
+                file_type=file_type,
+                chunk_size=kb_row["chunk_size"],
+                chunk_overlap=kb_row["chunk_overlap"]
+            )
+            await flush_namespace(CacheNS.KB_LIST)
+            await flush_namespace(CacheNS.KB_DOC_LIST)
+        except Exception as e:
+            logger.error("[upload] 后台解析任务异常: %s", e, exc_info=True)
+
+    asyncio.create_task(_background_process())
+
+    # 立即返回文档信息（状态=parsing）
+    await flush_namespace(CacheNS.KB_LIST)
+    # 生成后端代理预览URL（不暴露OSS直链）
+    oss_path = upload_info.get("oss_path", "")
+    preview_file_url = ""
+    if oss_path:
+        # oss_path在upload_file中已URL编码，需先解码再编码，防止双重编码
+        decoded_path = unquote(oss_path)
+        preview_file_url = f"/api/v1/files/preview?ossPath={quote(decoded_path, safe='')}&filename={quote(file_name, safe='')}"
+    return {
+        "message": "文件上传成功，正在解析中...",
+        "doc_id": upload_info["doc_id"],
+        "file_name": file_name,
+        "file_type": file_type,
+        "file_size": upload_info["file_size"],
+        "file_url": preview_file_url,
+        "parse_status": "parsing"
+    }
 
 
 @router.post("/{kb_id}/rebuild")
@@ -436,7 +468,6 @@ async def list_documents(
     """知识库文档列表（含OSS预览链接）"""
     pool = req.app.state.db_pool
     user_context = req.state.user_context
-    oss_service = getattr(req.app.state, "oss_service", None)
     offset = (page_num - 1) * page_size
 
     async with pool.acquire() as conn:
@@ -473,11 +504,16 @@ async def list_documents(
             for key in ("created_at", "updated_at"):
                 if item.get(key):
                     item[key] = item[key].isoformat()
-            # 生成OSS预览链接
-            if oss_service and item.get("oss_path"):
-                item["file_url"] = oss_service.get_resource_url(
-                    item["oss_path"], item.get("file_name") or item.get("title")
-                )
+            # 生成预览URL：通过Java后端代理转发，不暴露OSS直链
+            actual_filename = item.get("file_name") or item.get("title") or ""
+            item["preview_type"] = get_preview_type(actual_filename)
+            oss_path = item.get("oss_path") or ""
+            if oss_path:
+                # oss_path在DB中已是URL编码的（quote生成），需先解码再编码，防止双重编码
+                decoded_path = unquote(oss_path)
+                encoded_path = quote(decoded_path, safe='')
+                encoded_name = quote(actual_filename, safe='')
+                item["file_url"] = f"/api/v1/files/preview?ossPath={encoded_path}&filename={encoded_name}"
             else:
                 item["file_url"] = ""
 
@@ -542,6 +578,75 @@ async def reparse_document(kb_id: int, doc_id: int, req: Request):
     )
 
     return {"message": "已启动文档重解析", "doc_id": doc_id, "kb_id": kb_id}
+
+
+@router.get("/{kb_id}/documents/{doc_id}/chunks")
+async def list_document_chunks(
+    kb_id: int, doc_id: int, page_num: int = 1, page_size: int = 20, req: Request = None
+):
+    """文档切片列表（不含向量，含元数据）"""
+    pool = req.app.state.db_pool
+    user_context = req.state.user_context
+    offset = (page_num - 1) * page_size
+
+    async with pool.acquire() as conn:
+        # 权限校验
+        kb_row = await conn.fetchrow(
+            "SELECT scope_type, tenant_id, created_by FROM knowledge_base WHERE id = $1 AND is_deleted = FALSE",
+            kb_id
+        )
+        if not kb_row:
+            raise HTTPException(status_code=404, detail="知识库不存在")
+        if not is_platform_admin(user_context):
+            scope = kb_row["scope_type"]
+            if scope == "tenant" and kb_row["tenant_id"] != user_context.tenant_id:
+                raise HTTPException(status_code=403, detail="无权访问该知识库")
+            elif scope == "personal" and kb_row["created_by"] != user_context.user_id:
+                raise HTTPException(status_code=403, detail="无权访问该知识库")
+
+        # 确认文档存在
+        doc_row = await conn.fetchrow(
+            "SELECT id, file_name, title, chunk_count FROM knowledge_document WHERE id = $1 AND kb_id = $2 AND is_deleted = FALSE",
+            doc_id, kb_id
+        )
+        if not doc_row:
+            raise HTTPException(status_code=404, detail="文档不存在")
+
+        rows = await conn.fetch(
+            """SELECT id, chunk_index, content, token_count, metadata, created_at
+               FROM knowledge_chunk
+               WHERE doc_id = $1 AND is_deleted = FALSE
+               ORDER BY chunk_index ASC LIMIT $2 OFFSET $3""",
+            doc_id, page_size, offset
+        )
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM knowledge_chunk WHERE doc_id = $1 AND is_deleted = FALSE",
+            doc_id
+        )
+
+        items = []
+        for row in rows:
+            item = dict(row)
+            for key in ("created_at",):
+                if item.get(key):
+                    item[key] = item[key].isoformat()
+            # metadata 可能是 JSON string 或 dict
+            if isinstance(item.get("metadata"), str):
+                import json
+                try:
+                    item["metadata"] = json.loads(item["metadata"])
+                except Exception:
+                    item["metadata"] = {}
+            items.append(item)
+
+        return {
+            "total": total,
+            "page_num": page_num,
+            "page_size": page_size,
+            "doc_id": doc_id,
+            "doc_name": doc_row["file_name"] or doc_row["title"],
+            "items": items
+        }
 
 
 @router.delete("/{kb_id}/documents/{doc_id}")

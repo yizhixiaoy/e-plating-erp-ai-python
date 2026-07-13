@@ -1,4 +1,4 @@
-"""文档处理管道 - 上传→OSS备份→解析→切块→向量化→入库"""
+"""文档处理管道 - 上传→OSS→解析→切块→向量化→入库"""
 import os
 import json
 import uuid
@@ -7,6 +7,7 @@ import hashlib
 import tempfile
 import logging
 from datetime import datetime
+from fastapi import HTTPException
 from app.config import settings
 from app.parser.chunker import Chunker
 from app.services.embedding import embedding_service
@@ -44,6 +45,110 @@ class DocumentProcessor:
         self.oss_service = oss_service
         self.upload_dir = os.path.join(tempfile.gettempdir(), "ai_knowledge_uploads")
         os.makedirs(self.upload_dir, exist_ok=True)
+
+    async def quick_upload(
+        self,
+        kb_id: int,
+        tenant_id: int,
+        user_id: int,
+        file_name: str,
+        file_content: bytes,
+        file_type: str = None,
+    ) -> dict:
+        """快速上传阶段（同步）：上传到OSS + 创建DB记录（状态=parsing）
+
+        Returns:
+            {"doc_id": int, "file_name": str, "file_type": str, "file_size": int,
+             "oss_path": str, "file_url": str}
+        """
+        if not file_type:
+            file_type = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else "txt"
+
+        file_size = len(file_content)
+        content_type = self._guess_content_type(file_type)
+        file_hash = hashlib.sha256(file_content).hexdigest()
+
+        # 上传到OSS
+        oss_path = ""
+        file_url = ""
+        if self.oss_service and self.oss_service.enabled:
+            try:
+                object_name = self.oss_service.generate_kb_object_name(kb_id, file_type)
+                oss_path = await self.oss_service.upload_file(file_content, object_name, content_type)
+                file_url = self.oss_service.get_preview_url(oss_path, file_name)
+            except RuntimeError as oss_err:
+                logger.warning("[doc_processor] OSS上传失败: %s", oss_err)
+                raise HTTPException(status_code=500, detail=f"文件上传失败: {oss_err}")
+
+        # 创建文档记录（状态=parsing）
+        doc_id = await self._create_document_record(
+            kb_id, tenant_id, user_id, file_name,
+            file_type, file_size, oss_path, content_type, file_hash
+        )
+
+        return {
+            "doc_id": doc_id, "file_name": file_name, "file_type": file_type,
+            "file_size": file_size, "oss_path": oss_path, "file_url": file_url
+        }
+
+    async def process_in_background(
+        self,
+        doc_id: int,
+        kb_id: int,
+        tenant_id: int,
+        user_id: int,
+        oss_path: str,
+        file_type: str,
+        chunk_size: int = None,
+        chunk_overlap: int = None
+    ):
+        """后台异步处理：从OSS下载→解析→切块→向量化→更新状态"""
+        local_path = None
+        try:
+            # 从OSS下载到临时文件
+            file_content = await self.oss_service.download_file(oss_path)
+            file_id = str(uuid.uuid4())
+            local_path = os.path.join(self.upload_dir, f"{file_id}.{file_type}")
+            with open(local_path, "wb") as f:
+                f.write(file_content)
+
+            # 解析文档
+            text = await self._parse_document(local_path, file_type)
+            if not text or text.startswith("解析失败") or "依赖未安装" in text:
+                await self._update_document_status(doc_id, "failed", text)
+                return
+
+            # 切块
+            chunker = Chunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+            chunks = chunker.split(text)
+
+            if not chunks:
+                await self._update_document_status(doc_id, "failed", "文档内容为空或无法切分")
+                return
+
+            # 批量向量化
+            chunk_texts = [c["content"] for c in chunks]
+            embeddings = await asyncio.to_thread(embedding_service.encode, chunk_texts)
+
+            # 写入knowledge_chunk表
+            chunk_count = await self._insert_chunks(
+                doc_id, kb_id, tenant_id, user_id, chunks, embeddings
+            )
+
+            # 更新文档状态 + 知识库统计
+            await self._update_document_status(doc_id, "completed", chunk_count=chunk_count)
+            await self._update_kb_stats(kb_id, chunk_count)
+            logger.info("[doc_processor] 文档 %d 后台解析完成: %d 个片段", doc_id, chunk_count)
+
+        except Exception as e:
+            logger.error("[doc_processor] 文档 %d 后台解析失败: %s", doc_id, e, exc_info=True)
+            await self._update_document_status(doc_id, "failed", str(e))
+        finally:
+            if local_path:
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
 
     async def process_upload(
         self,
@@ -85,13 +190,18 @@ class DocumentProcessor:
         with open(local_path, "wb") as f:
             f.write(file_content)
 
-        # 2. 上传到OSS持久备份（OSS未启用时跳过，oss_path为空）
+        # 2. 上传到OSS持久备份（OSS未启用时跳过，oss_path为空；连接失败时降级处理）
         oss_path = ""
         file_url = ""
         if self.oss_service and self.oss_service.enabled:
-            object_name = self.oss_service.generate_kb_object_name(kb_id, file_type)
-            oss_path = await self.oss_service.upload_file(file_content, object_name, content_type)
-            file_url = self.oss_service.get_resource_url(oss_path, file_name)
+            try:
+                object_name = self.oss_service.generate_kb_object_name(kb_id, file_type)
+                oss_path = await self.oss_service.upload_file(file_content, object_name, content_type)
+                file_url = self.oss_service.get_preview_url(oss_path, file_name)
+            except RuntimeError as oss_err:
+                logger.warning("[doc_processor] OSS上传失败，文档将继续入库（无OSS备份）: %s", oss_err)
+                oss_path = ""
+                file_url = ""
 
         # 3. 创建文档记录（状态=parsing，含oss_path）
         doc_id = await self._create_document_record(

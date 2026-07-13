@@ -13,6 +13,7 @@ langgraph-checkpoint-postgres==3.1.0
 
 # Embedding与向量
 FlagEmbedding==1.4.0
+transformers>=4.40,<5.0  # FlagEmbedding 1.4.0不兼容transformers 5.x（prepare_for_model被删除）
 pgvector==0.3.0
 psycopg2-binary==2.9.10
 psycopg-binary==3.3.4
@@ -34,4 +35,5 @@ sqlalchemy==2.0.35
 httpx==0.28.0
 python-dotenv==1.0.1
 minio==7.2.15                 # MinIO/OSS对象存储
+oss2>=2.18.0                  # 阿里云OSS SDK
 redis[hiredis]==5.2.1         # Redis缓存

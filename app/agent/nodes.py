@@ -1,4 +1,5 @@
 """LangGraph节点实现：Planner / Executor / Aggregator"""
+import asyncio
 import inspect
 import json
 import logging
@@ -210,11 +211,18 @@ async def planner_node(state: AgentState, llm, tools: dict = None) -> dict:
         HumanMessage(content=planning_prompt)
     ]
 
-    response = await llm.ainvoke(
-        messages,
-        temperature=settings.PLANNER_TEMPERATURE,
-        max_tokens=settings.PLANNER_MAX_TOKENS
-    )
+    try:
+        response = await asyncio.wait_for(
+            llm.ainvoke(
+                messages,
+                temperature=settings.PLANNER_TEMPERATURE,
+                max_tokens=settings.PLANNER_MAX_TOKENS
+            ),
+            timeout=settings.LLM_INVOKE_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        logger.error("[planner] LLM调用超时（%ds）", settings.LLM_INVOKE_TIMEOUT)
+        return {"plan_steps": [], "plan_confirmed": True}
 
     try:
         content = _get_llm_content(response)
@@ -265,7 +273,18 @@ async def _execute_single_tool(
 
     # 执行工具
     try:
-        tool_result = await tool.execute(**tool_params)
+        tool_result = await asyncio.wait_for(
+            tool.execute(**tool_params),
+            timeout=settings.TOOL_EXECUTION_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        tool_results.append({"tool_name": tool_name, "error": f"工具执行超时（{settings.TOOL_EXECUTION_TIMEOUT}秒）"})
+        return {
+            "tool_calls_pending": pending_calls,
+            "tool_results": tool_results,
+            "knowledge_context": knowledge_context,
+            "references": references
+        }
     except Exception as ex:
         tool_results.append({"tool_name": tool_name, "error": str(ex)})
         return {
@@ -423,9 +442,20 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
 
             tool_params = _sanitize_tool_params(tool, tool_params)
 
+            logger.info("[executor] ▶ 开始执行工具: %s, params=%s", tool_name, list(tool_params.keys()))
             try:
-                tool_result = await tool.execute(**tool_params)
+                tool_result = await asyncio.wait_for(
+                    tool.execute(**tool_params),
+                    timeout=settings.TOOL_EXECUTION_TIMEOUT
+                )
+                logger.info("[executor] ✓ 工具 %s 执行成功", tool_name)
+            except asyncio.TimeoutError:
+                err_msg = f"工具 {tool_name} 执行超时（{settings.TOOL_EXECUTION_TIMEOUT}秒）"
+                logger.error("[executor] ✗ %s", err_msg)
+                tool_results.append({"tool_name": tool_name, "error": err_msg})
+                continue
             except Exception as e:
+                logger.error("[executor] ✗ 工具 %s 执行异常: %s", tool_name, e)
                 tool_results.append({"tool_name": tool_name, "error": str(e)})
                 continue
 
@@ -508,11 +538,18 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
         HumanMessage(content=executor_prompt)
     ]
 
-    response = await llm.ainvoke(
-        messages,
-        temperature=settings.EXECUTOR_TOOL_SELECT_TEMP,
-        max_tokens=settings.EXECUTOR_MAX_TOKENS
-    )
+    try:
+        response = await asyncio.wait_for(
+            llm.ainvoke(
+                messages,
+                temperature=settings.EXECUTOR_TOOL_SELECT_TEMP,
+                max_tokens=settings.EXECUTOR_MAX_TOKENS
+            ),
+            timeout=settings.LLM_INVOKE_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        logger.error("[executor] 工具选择LLM调用超时（%ds）", settings.LLM_INVOKE_TIMEOUT)
+        return {"tool_calls_pending": [], "tool_results": [{"tool_name": "tool_selector", "error": "工具选择超时"}], "knowledge_context": None, "references": []}
 
     try:
         content = _get_llm_content(response)
@@ -560,7 +597,30 @@ async def executor_node(state: AgentState, llm, tools: dict) -> dict:
         tool_params = _sanitize_tool_params(tool, tool_params)
 
         # 执行工具
-        tool_result = await tool.execute(**tool_params)
+        logger.info("[executor] ▶ 开始执行工具(单次): %s, params=%s", tool_name, list(tool_params.keys()))
+        try:
+            tool_result = await asyncio.wait_for(
+                tool.execute(**tool_params),
+                timeout=settings.TOOL_EXECUTION_TIMEOUT
+            )
+            logger.info("[executor] ✓ 工具 %s 执行成功", tool_name)
+        except asyncio.TimeoutError:
+            err_msg = f"工具 {tool_name} 执行超时（{settings.TOOL_EXECUTION_TIMEOUT}秒）"
+            logger.error("[executor] ✗ %s", err_msg)
+            return {
+                "tool_calls_pending": pending_calls,
+                "tool_results": [{"tool_name": tool_name, "error": err_msg}],
+                "knowledge_context": knowledge_context,
+                "references": references
+            }
+        except Exception as tool_exc:
+            logger.error("[executor] ✗ 工具 %s 执行异常: %s", tool_name, tool_exc)
+            return {
+                "tool_calls_pending": pending_calls,
+                "tool_results": [{"tool_name": tool_name, "error": str(tool_exc)}],
+                "knowledge_context": knowledge_context,
+                "references": references
+            }
 
         new_result = {
             "tool_name": tool_name,
@@ -695,11 +755,22 @@ async def aggregator_node(state: AgentState, llm) -> dict:
 
     try:
         # 使用 ainvoke - LangGraph 的 messages stream mode 会捕获 token 事件
-        response = await llm.ainvoke(
-            lc_messages,
-            temperature=settings.LLM_TEMPERATURE,
-            max_tokens=settings.LLM_MAX_TOKENS
+        response = await asyncio.wait_for(
+            llm.ainvoke(
+                lc_messages,
+                temperature=settings.LLM_TEMPERATURE,
+                max_tokens=settings.LLM_MAX_TOKENS
+            ),
+            timeout=settings.LLM_INVOKE_TIMEOUT
         )
+    except asyncio.TimeoutError:
+        logger.error("[aggregator] LLM调用超时（%ds）", settings.LLM_INVOKE_TIMEOUT)
+        return {
+            "final_response": f"抱歉，生成回答超时（{settings.LLM_INVOKE_TIMEOUT}秒），请稍后重试",
+            "token_usage": {"input": 0, "output": 0},
+            "references": references,
+            "error": "LLM调用超时"
+        }
     except Exception as e:
         import traceback, logging
         logger = logging.getLogger(__name__)

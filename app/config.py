@@ -41,6 +41,7 @@ class Settings:
     LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.3"))
     LLM_REASONING_TEMPERATURE: float = float(os.getenv("LLM_REASONING_TEMPERATURE", "0.1"))
     LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+    LLM_INVOKE_TIMEOUT: int = int(os.getenv("LLM_INVOKE_TIMEOUT", "120"))  # LLM单次调用超时秒数
 
     # LLM - Qwen（智能体决策/任务规划）
     QWEN_API_KEY: str = os.getenv("QWEN_API_KEY", "sk-1f9d720eecb14b629ea92f2f0ef2285b")
@@ -74,13 +75,32 @@ class Settings:
             return f"redis://:{self.REDIS_PASSWORD}@{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
         return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
 
-    # MinIO / OSS
+    # OSS存储配置（与Java后端OssStorageFactory保持一致，支持 aliyun / minio / tencent）
+    OSS_PROVIDER: str = os.getenv("OSS_PROVIDER", "aliyun")  # 存储提供商：aliyun / minio / tencent
+    # 阿里云OSS
+    ALIYUN_ENDPOINT: str = os.getenv("ALIYUN_ENDPOINT", "oss-cn-hangzhou.aliyuncs.com")
+    ALIYUN_ACCESS_KEY_ID: str = os.getenv("ALIYUN_ACCESS_KEY_ID", "LTAI5t7VXr4wR8qNy62CMbKN")
+    ALIYUN_ACCESS_KEY_SECRET: str = os.getenv("ALIYUN_ACCESS_KEY_SECRET", "wKc77oBvljOqYOuUjV83wAm8qZ6XLC")
+    ALIYUN_BUCKET: str = os.getenv("ALIYUN_BUCKET", "e-plating-erp")
+    ALIYUN_DOMAIN: str = os.getenv("ALIYUN_DOMAIN", "")  # CDN自定义域名（与Java oss.aliyun.domain一致）
+    ALIYUN_REGION: str = os.getenv("ALIYUN_REGION", "cn-hangzhou")  # OSS区域，用于V4签名（与endpoint对应）
+    # IMM文档预览配置（阿里云智能媒体管理，用于PDF/Office等文档在线预览）
+    IMM_PREVIEW_ENABLED: bool = os.getenv("IMM_PREVIEW_ENABLED", "true").lower() == "true"  # 是否启用IMM预览
+    IMM_PREVIEW_EXPIRE: int = int(os.getenv("IMM_PREVIEW_EXPIRE", "3600"))  # 预览URL有效期（秒）
+    # MinIO
+    MINIO_ENDPOINT: str = os.getenv("MINIO_ENDPOINT", "127.0.0.1:9000")
+    MINIO_ACCESS_KEY: str = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+    MINIO_SECRET_KEY: str = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+    MINIO_BUCKET: str = os.getenv("MINIO_BUCKET", "e-plating-erp")
+    MINIO_SECURE: bool = os.getenv("MINIO_SECURE", "false").lower() == "true"
+    MINIO_REGION: str = os.getenv("MINIO_REGION", "")
+    # 兼容旧配置（向后兼容，优先使用新配置）
     OSS_ENABLED: bool = os.getenv("OSS_ENABLED", "true").lower() == "true"
-    OSS_ENDPOINT: str = os.getenv("OSS_ENDPOINT", "127.0.0.1:9000")
-    OSS_ACCESS_KEY: str = os.getenv("OSS_ACCESS_KEY", "minioadmin")
-    OSS_SECRET_KEY: str = os.getenv("OSS_SECRET_KEY", "minioadmin")
-    OSS_BUCKET: str = os.getenv("OSS_BUCKET", "ai-knowledge")
-    OSS_SECURE: bool = os.getenv("OSS_SECURE", "false").lower() == "true"
+    OSS_ENDPOINT: str = os.getenv("OSS_ENDPOINT", "") or os.getenv("MINIO_ENDPOINT", "127.0.0.1:9000")
+    OSS_ACCESS_KEY: str = os.getenv("OSS_ACCESS_KEY", "") or os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+    OSS_SECRET_KEY: str = os.getenv("OSS_SECRET_KEY", "") or os.getenv("MINIO_SECRET_KEY", "minioadmin")
+    OSS_BUCKET: str = os.getenv("OSS_BUCKET", "") or os.getenv("ALIYUN_BUCKET", "e-plating-erp")
+    OSS_SECURE: bool = os.getenv("OSS_SECURE", "").lower() == "true" if os.getenv("OSS_SECURE") else os.getenv("MINIO_SECURE", "false").lower() == "true"
 
     # 文件上传限制
     MAX_KB_FILE_SIZE: int = int(os.getenv("MAX_KB_FILE_SIZE", str(50 * 1024 * 1024)))    # 知识库文档50MB
@@ -95,6 +115,7 @@ class Settings:
     # Agent配置
     AGENT_MAX_STEPS: int = int(os.getenv("AGENT_MAX_STEPS", "10"))
     AGENT_CONFIRM_THRESHOLD: str = os.getenv("AGENT_CONFIRM_THRESHOLD", "complex")
+    TOOL_EXECUTION_TIMEOUT: int = int(os.getenv("TOOL_EXECUTION_TIMEOUT", "120"))  # 单个工具执行超时秒数（知识库首次加载模型需60s+）
 
     # RAG配置
     RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "5"))

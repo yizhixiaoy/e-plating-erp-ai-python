@@ -64,26 +64,31 @@ class KnowledgeTool(BaseTool):
         4. Rerank（bge-reranker-v2-m3）→ 精排取top_k
         """
         top_k = top_k or self.top_k
-
+        
         if not self.db_pool:
             logger.warning("[knowledge] 数据库连接池未就绪")
             return {"content": "知识库检索服务暂未就绪", "references": []}
-
+        
+        import time as _t
+        _t0 = _t.time()
+        
         try:
             async with self.db_pool.acquire() as conn:
                 await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-
-                # 构建通用过滤条件
+        
+                # 构建常用过滤条件
                 kb_filter, tenant_filter, base_params = self._build_filters(
                     kb_ids, tenant_id, is_platform_admin=is_platform_admin
                 )
-
+        
                 logger.info("[knowledge] 开始检索: query=%r, kb_ids=%s, tenant_id=%s, top_k=%d",
                            query[:80], kb_ids, tenant_id, top_k)
-
+        
                 # ── 1. 向量检索 ──
+                _t1 = _t.time()
                 query_embedding = await self._get_query_embedding(query)
-                vector_params = [query_embedding] + base_params
+                logger.info("[knowledge] 向量生成耗时: %.1fs", _t.time() - _t1)
+                vector_params = [str(query_embedding)] + base_params
                 vector_sql = f"""
                     SELECT c.id, c.doc_id, c.chunk_index, c.content,
                            c.metadata, c.kb_id,
@@ -99,8 +104,10 @@ class KnowledgeTool(BaseTool):
                     ORDER BY c.embedding <=> $1::vector
                     LIMIT {top_k * 3}
                 """
+                _t2 = _t.time()
                 vector_rows = await conn.fetch(vector_sql, *vector_params)
-
+                logger.info("[knowledge] 向量检索耗时: %.1fs, rows=%d", _t.time() - _t2, len(vector_rows))
+        
                 # ── 2. BM25全文检索（pg_trgm） ──
                 bm25_params = [query] + base_params
                 bm25_sql = f"""
@@ -120,24 +127,29 @@ class KnowledgeTool(BaseTool):
                     LIMIT {top_k * 3}
                 """
                 try:
+                    _t3 = _t.time()
                     bm25_rows = await conn.fetch(bm25_sql, *bm25_params)
+                    logger.info("[knowledge] BM25检索耗时: %.1fs, rows=%d", _t.time() - _t3, len(bm25_rows))
                 except Exception:
                     # pg_trgm可能未启用或%操作符失败，降级仅用向量结果
                     bm25_rows = []
-
+                    logger.info("[knowledge] BM25检索失败(降级), 耗时: %.1fs", _t.time() - _t3)
+        
                 # ── 3. RRF融合 ──
                 fused = self._rrf_fusion(vector_rows, bm25_rows, k=60)
-
+        
                 if not fused:
-                    logger.info("[knowledge] 检索无结果: query=%r", query[:80])
+                    logger.info("[knowledge] 检索无结果: query=%r, 总耗时=%.1fs", query[:80], _t.time() - _t0)
                     return {"content": "未找到相关知识。", "references": []}
-
+        
                 # ── 4. Rerank精排（取前top_k*2候选重排序） ──
                 candidates = fused[:top_k * 2]
                 if self.rerank_enabled and len(candidates) > 1:
                     try:
+                        _t4 = _t.time()
                         reranked = await self._rerank(query, candidates)
                         candidates = reranked
+                        logger.info("[knowledge] Rerank耗时: %.1fs", _t.time() - _t4)
                     except Exception as e:
                         logger.warning("[knowledge] Rerank失败，使用RRF结果降级: %s", e)
 
@@ -180,9 +192,10 @@ class KnowledgeTool(BaseTool):
 
                 context = "\n\n---\n\n".join(context_parts) if context_parts else "未找到相关知识。"
 
-                logger.info("[knowledge] 检索完成: query=%r, results=%d, top_score=%.4f",
+                logger.info("[knowledge] 检索完成: query=%r, results=%d, top_score=%.4f, 总耗时=%.1fs",
                            query[:80], len(references),
-                           references[0]["similarity"] if references else 0)
+                           references[0]["similarity"] if references else 0,
+                           _t.time() - _t0)
 
                 return {
                     "content": context,
@@ -190,7 +203,7 @@ class KnowledgeTool(BaseTool):
                 }
 
         except Exception as e:
-            logger.error("[knowledge] 检索异常: query=%r, err=%s", query[:80], e, exc_info=True)
+            logger.error("[knowledge] 检索异常: query=%r, err=%s, 耗时=%.1fs", query[:80], e, _t.time() - _t0, exc_info=True)
             return {
                 "content": f"知识库检索异常，请稍后重试",
                 "references": []
@@ -264,13 +277,17 @@ class KnowledgeTool(BaseTool):
 
     async def _rerank(self, query: str, candidates: list[dict]) -> list[dict]:
         """使用bge-reranker-v2-m3对候选结果重排序"""
+        import time as _t
         if not self.reranker:
             try:
                 from FlagEmbedding import FlagReranker
+                logger.info("[knowledge] 开始加载Reranker模型: %s", settings.RERANK_MODEL)
+                _tl = _t.time()
                 # FlagReranker初始化是CPU密集操作，放入线程池
                 self.reranker = await asyncio.to_thread(
                     lambda: FlagReranker(settings.RERANK_MODEL, use_fp16=True)
                 )
+                logger.info("[knowledge] Reranker模型加载完成: %.1fs", _t.time() - _tl)
             except ImportError:
                 self.rerank_enabled = False
                 return candidates
@@ -279,9 +296,11 @@ class KnowledgeTool(BaseTool):
         pairs = [(query, c["content"]) for c in candidates]
 
         # FlagReranker.compute_score是CPU密集操作，放入线程池避免阻塞事件循环
+        _ti = _t.time()
         rerank_scores = await asyncio.to_thread(
             lambda: self.reranker.compute_score(pairs, normalize=True)
         )
+        logger.info("[knowledge] Reranker推理耗时: %.1fs", _t.time() - _ti)
 
         # 将分数赋回候选
         if isinstance(rerank_scores, (list, tuple)):
@@ -297,6 +316,7 @@ class KnowledgeTool(BaseTool):
 
     async def _get_query_embedding(self, query: str) -> list[float]:
         """获取查询向量（首次调用时加载模型）"""
+        import time as _t
         if self._embedding_load_error:
             raise RuntimeError(f"Embedding模型加载失败: {self._embedding_load_error}")
 
@@ -304,6 +324,7 @@ class KnowledgeTool(BaseTool):
             try:
                 from FlagEmbedding import FlagModel
                 logger.info("[knowledge] 开始加载Embedding模型: %s", settings.EMBEDDING_MODEL)
+                _tl = _t.time()
                 # FlagModel初始化是CPU密集操作（加载模型权重），放入线程池避免阻塞事件循环
                 self.embedding_model = await asyncio.to_thread(
                     lambda: FlagModel(
@@ -312,13 +333,15 @@ class KnowledgeTool(BaseTool):
                     )
                 )
                 self.embedding_ready = True
-                logger.info("[knowledge] Embedding模型加载完成: %s", settings.EMBEDDING_MODEL)
+                logger.info("[knowledge] Embedding模型加载完成: %.1fs", _t.time() - _tl)
             except Exception as e:
                 self._embedding_load_error = str(e)
                 logger.error("[knowledge] Embedding模型加载失败: %s, err=%s", settings.EMBEDDING_MODEL, e)
                 raise RuntimeError(f"Embedding模型加载失败: {e}")
         # FlagEmbedding.encode是CPU密集操作，放入线程池避免阻塞事件循环
+        _ti = _t.time()
         embedding = await asyncio.to_thread(
             lambda: self.embedding_model.encode(query)
         )
+        logger.info("[knowledge] Embedding推理耗时: %.1fs", _t.time() - _ti)
         return embedding.tolist()
