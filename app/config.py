@@ -18,10 +18,10 @@ class Settings:
 
     # PostgreSQL
     PG_HOST: str = os.getenv("PG_HOST", "127.0.0.1")
-    PG_PORT: int = int(os.getenv("PG_PORT", "5432"))
-    PG_USER: str = os.getenv("PG_USER", "postgres")
-    PG_PASSWORD: str = os.getenv("PG_PASSWORD", "postgres")
-    PG_DATABASE: str = os.getenv("PG_DATABASE", "erp_ai")
+    PG_PORT: int = int(os.getenv("PG_PORT", ""))
+    PG_USER: str = os.getenv("PG_USER", "")
+    PG_PASSWORD: str = os.getenv("PG_PASSWORD", "")
+    PG_DATABASE: str = os.getenv("PG_DATABASE", "")
     PG_POOL_MIN: int = int(os.getenv("PG_POOL_MIN", "2"))
     PG_POOL_MAX: int = int(os.getenv("PG_POOL_MAX", "10"))
 
@@ -34,7 +34,7 @@ class Settings:
 
     # LLM - DeepSeek（高性价比对话 & 复杂推理）
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "deepseek")  # deepseek / qwen
-    LLM_API_KEY: str = os.getenv("LLM_API_KEY", "sk-416efaf437694b2fa59bdf22d8839d37")
+    LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
     LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1")
     LLM_MODEL_CHAT: str = os.getenv("LLM_MODEL_CHAT", "deepseek-v4-flash")       # 高性价比对话
     LLM_MODEL_REASON: str = os.getenv("LLM_MODEL_REASON", "deepseek-v4-pro")     # 复杂推理
@@ -44,7 +44,7 @@ class Settings:
     LLM_INVOKE_TIMEOUT: int = int(os.getenv("LLM_INVOKE_TIMEOUT", "120"))  # LLM单次调用超时秒数
 
     # LLM - Qwen（智能体决策/任务规划）
-    QWEN_API_KEY: str = os.getenv("QWEN_API_KEY", "sk-1f9d720eecb14b629ea92f2f0ef2285b")
+    QWEN_API_KEY: str = os.getenv("QWEN_API_KEY", "")
     QWEN_BASE_URL: str = os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
     QWEN_MODEL: str = os.getenv("QWEN_MODEL", "qwen3.7-max")                   # Qwen3.7-Max 旗舰模型
 
@@ -59,13 +59,13 @@ class Settings:
 
     # Java后端API
     JAVA_API_BASE_URL: str = os.getenv("JAVA_API_BASE_URL", "http://127.0.0.1:8080")
-    JAVA_API_KEY: str = os.getenv("JAVA_API_KEY", "807a4f25de31d333437d71f771bc2b30")
+    JAVA_API_KEY: str = os.getenv("JAVA_API_KEY", "")
     JAVA_API_TIMEOUT: int = int(os.getenv("JAVA_API_TIMEOUT", "30"))
 
     # Redis
     REDIS_HOST: str = os.getenv("REDIS_HOST", "127.0.0.1")
-    REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
-    REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "redis2026")
+    REDIS_PORT: int = int(os.getenv("REDIS_PORT", ""))
+    REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
     REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
     REDIS_PREFIX: str = os.getenv("REDIS_PREFIX", "erp_ai:")
 
@@ -79,9 +79,9 @@ class Settings:
     OSS_PROVIDER: str = os.getenv("OSS_PROVIDER", "aliyun")  # 存储提供商：aliyun / minio / tencent
     # 阿里云OSS
     ALIYUN_ENDPOINT: str = os.getenv("ALIYUN_ENDPOINT", "oss-cn-hangzhou.aliyuncs.com")
-    ALIYUN_ACCESS_KEY_ID: str = os.getenv("ALIYUN_ACCESS_KEY_ID", "LTAI5t7VXr4wR8qNy62CMbKN")
-    ALIYUN_ACCESS_KEY_SECRET: str = os.getenv("ALIYUN_ACCESS_KEY_SECRET", "wKc77oBvljOqYOuUjV83wAm8qZ6XLC")
-    ALIYUN_BUCKET: str = os.getenv("ALIYUN_BUCKET", "e-plating-erp")
+    ALIYUN_ACCESS_KEY_ID: str = os.getenv("ALIYUN_ACCESS_KEY_ID", "")
+    ALIYUN_ACCESS_KEY_SECRET: str = os.getenv("ALIYUN_ACCESS_KEY_SECRET", "")
+    ALIYUN_BUCKET: str = os.getenv("ALIYUN_BUCKET", "")
     ALIYUN_DOMAIN: str = os.getenv("ALIYUN_DOMAIN", "")  # CDN自定义域名（与Java oss.aliyun.domain一致）
     ALIYUN_REGION: str = os.getenv("ALIYUN_REGION", "cn-hangzhou")  # OSS区域，用于V4签名（与endpoint对应）
     # IMM文档预览配置（阿里云智能媒体管理，用于PDF/Office等文档在线预览）
@@ -89,17 +89,17 @@ class Settings:
     IMM_PREVIEW_EXPIRE: int = int(os.getenv("IMM_PREVIEW_EXPIRE", "3600"))  # 预览URL有效期（秒）
     # MinIO
     MINIO_ENDPOINT: str = os.getenv("MINIO_ENDPOINT", "127.0.0.1:9000")
-    MINIO_ACCESS_KEY: str = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-    MINIO_SECRET_KEY: str = os.getenv("MINIO_SECRET_KEY", "minioadmin")
-    MINIO_BUCKET: str = os.getenv("MINIO_BUCKET", "e-plating-erp")
+    MINIO_ACCESS_KEY: str = os.getenv("MINIO_ACCESS_KEY", "")
+    MINIO_SECRET_KEY: str = os.getenv("MINIO_SECRET_KEY", "")
+    MINIO_BUCKET: str = os.getenv("MINIO_BUCKET", "")
     MINIO_SECURE: bool = os.getenv("MINIO_SECURE", "false").lower() == "true"
     MINIO_REGION: str = os.getenv("MINIO_REGION", "")
     # 兼容旧配置（向后兼容，优先使用新配置）
     OSS_ENABLED: bool = os.getenv("OSS_ENABLED", "true").lower() == "true"
     OSS_ENDPOINT: str = os.getenv("OSS_ENDPOINT", "") or os.getenv("MINIO_ENDPOINT", "127.0.0.1:9000")
-    OSS_ACCESS_KEY: str = os.getenv("OSS_ACCESS_KEY", "") or os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-    OSS_SECRET_KEY: str = os.getenv("OSS_SECRET_KEY", "") or os.getenv("MINIO_SECRET_KEY", "minioadmin")
-    OSS_BUCKET: str = os.getenv("OSS_BUCKET", "") or os.getenv("ALIYUN_BUCKET", "e-plating-erp")
+    OSS_ACCESS_KEY: str = os.getenv("OSS_ACCESS_KEY", "") or os.getenv("MINIO_ACCESS_KEY", "")
+    OSS_SECRET_KEY: str = os.getenv("OSS_SECRET_KEY", "") or os.getenv("MINIO_SECRET_KEY", "")
+    OSS_BUCKET: str = os.getenv("OSS_BUCKET", "") or os.getenv("ALIYUN_BUCKET", "")
     OSS_SECURE: bool = os.getenv("OSS_SECURE", "").lower() == "true" if os.getenv("OSS_SECURE") else os.getenv("MINIO_SECURE", "false").lower() == "true"
 
     # 文件上传限制
