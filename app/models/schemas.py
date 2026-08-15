@@ -31,6 +31,8 @@ class ChatRequest(BaseModel):
     conversation_id: Optional[int] = Field(None, description="会话ID，为空则创建新会话")
     kb_ids: Optional[list[int]] = Field(None, description="指定知识库ID列表")
     file_ids: Optional[list[str]] = Field(None, description="上传的临时文件ID列表")
+    confirmed_plan: Optional[list[dict]] = Field(None, description="用户确认的执行计划（确认后立即执行）")
+    original_query: Optional[str] = Field(None, description="确认plan时的原始用户问题（用于aggregator生成回答上下文）")
 
 
 class ChatResponse(BaseModel):
@@ -69,13 +71,17 @@ class MessageView(BaseModel):
     conversation_id: int
     role: str
     content: Optional[str] = None
+    model_name: Optional[str] = None
     tool_calls: Optional[Any] = None
     references: list[ReferenceSource] = Field(default_factory=list)
     token_count: Optional[int] = None
+    token_usage: Optional[dict] = None
+    file_ids: list[str] = Field(default_factory=list)
     created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
+        protected_namespaces = ()
 
 
 # ─── SSE事件 ──────────────────────────────────────────────
@@ -138,9 +144,9 @@ class SSEErrorData(BaseModel):
 
 # ─── 知识库 ───────────────────────────────────────────────
 class KnowledgeBaseScope(str, Enum):
-    PUBLIC = "public"
+    GLOBAL = "global"
     TENANT = "tenant"
-    PRIVATE = "private"
+    PERSONAL = "personal"
 
 
 class KnowledgeBaseCreate(BaseModel):
@@ -255,6 +261,8 @@ class UserContext(BaseModel):
     """从Java网关透传的用户上下文"""
     tenant_id: int
     user_id: int
+    username: str = ""
+    nickname: str = ""
     roles: list[str] = Field(default_factory=list)
     permissions: list[str] = Field(default_factory=list)
     data_scope: Optional[str] = None

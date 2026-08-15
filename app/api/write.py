@@ -6,6 +6,8 @@ from sse_starlette.sse import EventSourceResponse
 from app.models.schemas import WriterRequest
 from app.services.llm_factory import create_llm
 from app.services.writer import WriterService
+from app.services.permissions import require_perm, AI_PERMS, is_platform_admin
+from app.config import settings
 
 router = APIRouter(prefix="/api/ai/write", tags=["AI写作"])
 
@@ -19,7 +21,7 @@ async def writer_stream_generator(prompt_data: dict):
         HumanMessage(content=prompt_data["user_prompt"])
     ]
 
-    llm = create_llm(streaming=True, temperature=0.7)
+    llm = create_llm(streaming=True, temperature=settings.LLM_WRITER_TEMPERATURE)
 
     yield {
         "event": "thinking",
@@ -55,7 +57,31 @@ async def writer_stream_generator(prompt_data: dict):
 @router.post("")
 async def write(request: WriterRequest, req: Request):
     """AI写作接口"""
-    prompt_data = WriterService.build_prompt(request)
+    user_context = req.state.user_context
+
+    # 权限守卫
+    require_perm(user_context, AI_PERMS.WRITER_VIEW, "使用AI写作")
+
+    pool = req.app.state.db_pool
+    oss_service = getattr(req.app.state, "oss_service", None)
+
+    # 如果指定了参考文档ID，从知识库检索相关内容作为写作素材
+    knowledge_context = ""
+    if request.ref_doc_ids:
+        from app.tools.knowledge import KnowledgeTool
+        tool = KnowledgeTool(db_pool=pool, oss_service=oss_service)
+        # 使用写作主题作为检索query，从指定文档所在知识库检索
+        result = await tool.execute(
+            query=request.topic,
+            kb_ids=None,  # 从所有可见库检索
+            top_k=settings.RAG_TOP_K,
+            tenant_id=user_context.tenant_id,
+            is_platform_admin=is_platform_admin(user_context)
+        )
+        if result.get("content") and result["content"] != "未找到相关知识。":
+            knowledge_context = result["content"]
+
+    prompt_data = WriterService.build_prompt(request, knowledge_context=knowledge_context)
 
     return EventSourceResponse(
         writer_stream_generator(prompt_data),

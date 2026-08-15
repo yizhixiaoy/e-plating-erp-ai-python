@@ -71,8 +71,13 @@ class WriterService:
     """写作助手服务"""
 
     @staticmethod
-    def build_prompt(request: WriterRequest) -> dict:
-        """构建写作Prompt"""
+    def build_prompt(request: WriterRequest, knowledge_context: str = "") -> dict:
+        """构建写作Prompt
+
+        Args:
+            request: 写作请求
+            knowledge_context: 知识库检索到的参考内容（可选）
+        """
         template = WRITER_TEMPLATES.get(
             request.template_type,
             WRITER_TEMPLATES[WriterTemplate.CUSTOM]
@@ -96,6 +101,13 @@ class WriterService:
         )
 
         system_prompt = "你是电镀行业ERP系统的专业写作助手，擅长撰写各类商务和工艺文档。"
+
+        # 注入知识库参考内容
+        if knowledge_context:
+            system_prompt += (
+                "\n\n【参考资料】以下是从知识库检索到的相关内容，请在写作中适当引用：\n"
+                f"{knowledge_context}"
+            )
 
         return {
             "system_prompt": system_prompt,
